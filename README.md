@@ -42,7 +42,3 @@ Integration lane runs them (see `ci/`).
   `SPDX-License-Identifier: Apache-2.0`, and the files that Apoxy changed say so.
 - `replay` is from WireGuard and keeps its MIT license header.
 - The eBPF C sources in `filter/ebpf` keep their GPL-2.0 license headers.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
