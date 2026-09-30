@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"fmt"
 	"net"
-	"net/netip"
 	"testing"
 	"time"
 
@@ -14,31 +13,28 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/tcpip"
 
-	"github.com/apoxy-dev/icx"
 	"github.com/apoxy-dev/icx/forwarder"
-	"github.com/apoxy-dev/icx/psp"
 	"github.com/apoxy-dev/icx/veth"
 )
 
-// TestForwarderCryptoMultiQueue drives the REAL AF_XDP crypto datapath through a
+// TestForwarderMultiQueue drives the REAL AF_XDP decap datapath through a
 // MULTI-QUEUE forwarder: phy and virt veths with several queues, so NewForwarder
 // binds one phy/virt socket pair per queue and Start spawns one processFrames
-// goroutine per queue — all decapsulating through the SAME shared *icx.Handler at
-// once. TestForwarderCryptoRoundTrip covers only the single-queue path; this test
-// closes the multiqueue seam on a real kernel.
+// goroutine per queue — all decapsulating through the SAME shared decapPipe at
+// once. TestForwarderDecapRoundTrip covers only the single-queue path; this test
+// covers the multiqueue path on a real kernel.
 //
-// It injects many distinct inner flows. With WithSourcePortHashing on the encap
-// side, each flow gets a different outer UDP source port, so the veth's RX hashing
-// spreads the encapsulated frames across the queues and several processFrames
-// goroutines do real concurrent decap work. The assertion is that EVERY distinct
-// flow's canary is recovered on the virt side: a wedged or mis-bound queue
-// goroutine would silently swallow the flows hashed to it, and a concurrency bug
-// in the shared handler would corrupt or drop frames. Run under -race (the dagger
-// Integration lane default) it also exercises the N-goroutine datapath for data
-// races that the single-queue tests cannot reach.
-func TestForwarderCryptoMultiQueue(t *testing.T) {
+// It injects many distinct inner flows. Each flow gets a different outer UDP
+// source port, so the veth's RX hashing spreads the encapsulated frames across
+// the queues and several processFrames goroutines do real concurrent decap work.
+// The assertion is that EVERY distinct flow's canary is recovered on the virt
+// side: a wedged or mis-bound queue goroutine would silently swallow the flows
+// hashed to it, and a concurrency bug in the datapath would corrupt or drop
+// frames. Run under -race (the dagger Integration lane default) it also
+// exercises the N-goroutine datapath for data races that the single-queue tests
+// cannot reach.
+func TestForwarderMultiQueue(t *testing.T) {
 	requireForwarderEnv(t)
 
 	const numQueues = 4
@@ -51,52 +47,7 @@ func TestForwarderCryptoMultiQueue(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, virtDev.Close()) })
 
-	virtMAC := tcpip.LinkAddress(virtDev.Peer.Attrs().HardwareAddr)
-
-	localUnderlay := &tcpip.FullAddress{
-		Addr:     tcpip.AddrFrom4Slice(net.IPv4(192, 168, 1, 1).To4()),
-		Port:     6081,
-		LinkAddr: tcpip.LinkAddress("\x02\x00\x00\x00\x0a\x01"),
-	}
-	remoteUnderlay := &tcpip.FullAddress{
-		Addr:     tcpip.AddrFrom4Slice(net.IPv4(192, 168, 1, 2).To4()),
-		Port:     6081,
-		LinkAddr: tcpip.LinkAddress("\x02\x00\x00\x00\x0a\x02"),
-	}
-
-	const vni uint = 0x1234
-	prefix := netip.MustParsePrefix("10.99.0.0/24")
-	routes := []icx.Route{{Src: prefix, Dst: prefix}}
-
-	var master [32]byte
-	copy(master[:], []byte("icx-mq-master-secret-000000000!!"))
-	rxH, txH, err := psp.EpochSPIs(psp.Initiator, 1)
-	require.NoError(t, err)
-	rxE, txE, err := psp.EpochSPIs(psp.Responder, 1)
-	require.NoError(t, err)
-	expires := time.Now().Add(time.Hour)
-
-	// The forwarder's handler: decapsulates inbound frames under its own receive
-	// SPI (== the offline peer's transmit SPI, derived from the shared master).
-	h, err := icx.NewHandler(
-		icx.WithLocalAddr(localUnderlay),
-		icx.WithVirtMAC(virtMAC),
-	)
-	require.NoError(t, err)
-	require.NoError(t, h.AddVirtualNetwork(vni, remoteUnderlay, routes))
-	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, master, rxH, txH, expires))
-
-	// Offline peer that mints genuinely-encrypted frames under the mirrored role. Source-
-	// port hashing makes each inner flow take a distinct outer UDP source port, so
-	// the veth spreads the frames across the phy's RX queues.
-	encapH, err := icx.NewHandler(
-		icx.WithLocalAddr(localUnderlay),
-		icx.WithVirtMAC(virtMAC),
-		icx.WithSourcePortHashing(),
-	)
-	require.NoError(t, err)
-	require.NoError(t, encapH.AddVirtualNetwork(vni, remoteUnderlay, routes))
-	require.NoError(t, encapH.UpdateVirtualNetworkSecret(vni, master, rxE, txE, expires))
+	h := &decapPipe{virtMAC: virtDev.Peer.Attrs().HardwareAddr}
 
 	// No WithPhyFilter: use the production default phy filter (filter.Geneve on UDP
 	// 6081), so this test also exercises the geneve.c XDP program — the production
@@ -113,10 +64,10 @@ func TestForwarderCryptoMultiQueue(t *testing.T) {
 	// the still-running datapath goroutines.
 	runForwarder(t, fwd)
 
-	// Build a distinct inner flow per canary: distinct inner source address (within
-	// the route prefix) and a unique 32-byte canary payload, so a recovered frame
-	// is unambiguously attributable to its flow. Distinct sources => distinct flow
-	// hashes => distinct outer source ports => RX-queue spread.
+	// Build a distinct inner flow per canary: distinct inner source address and a
+	// unique 32-byte canary payload, so a recovered frame is unambiguously
+	// attributable to its flow. Each flow gets its own outer source port, which
+	// spreads the flows across the RX queues.
 	const flows = 16
 	innerIPs := make([][]byte, flows)
 	virtFrames := make([][]byte, flows)
@@ -171,14 +122,9 @@ func TestForwarderCryptoMultiQueue(t *testing.T) {
 	recvBuf := make([]byte, 2048)
 	deadline := time.Now().Add(12 * time.Second)
 	for time.Now().Before(deadline) && remaining > 0 {
-		// Inject one fresh encrypted frame for every flow this round (fresh nonce
-		// each time, so none is dropped as a replay).
+		// Inject one frame for every flow this round.
 		for k := 0; k < flows; k++ {
-			phyBuf := make([]byte, 2048)
-			n, handled := encapH.VirtToPhy(virtFrames[k], phyBuf)
-			require.Greater(t, n, 0)
-			require.False(t, handled)
-			enc := phyBuf[:n]
+			enc := encapFrame(t, innerIPs[k], uint16(49152+k))
 			copy(enc[0:6], phyDstMAC)
 			copy(enc[6:12], phySrcMAC)
 			require.NoError(t, unix.Sendto(sendFD, enc, 0, sa))
@@ -212,7 +158,7 @@ func TestForwarderCryptoMultiQueue(t *testing.T) {
 				missing = append(missing, k)
 			}
 		}
-		t.Fatalf("multiqueue decap dropped %d/%d flows (missing flow indices %v); a queue goroutine wedged or mis-bound, or the shared handler corrupted frames under concurrency",
+		t.Fatalf("multiqueue decap dropped %d/%d flows (missing flow indices %v); a queue goroutine wedged or mis-bound, or the forwarder corrupted frames under concurrency",
 			remaining, flows, missing)
 	}
 }

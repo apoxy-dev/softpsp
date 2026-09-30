@@ -9,9 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apoxy-dev/icx"
 	"github.com/stretchr/testify/require"
-	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
 // TestOpenRealDeviceSmoke exercises the real /dev/net/tun device-creation glue:
@@ -27,14 +25,8 @@ func TestOpenRealDeviceSmoke(t *testing.T) {
 		t.Skipf("no /dev/net/tun: %v", err)
 	}
 
-	h, err := icx.NewHandler(
-		icx.WithLocalAddr(&tcpip.FullAddress{Addr: tcpip.AddrFrom4([4]byte{127, 0, 0, 1}), Port: 6081}),
-		icx.WithLayer3VirtFrames(),
-	)
-	require.NoError(t, err)
-
 	dp, err := Open(OpenConfig{
-		Engine:       h,
+		Engine:       &fakeEngine{},
 		Name:         "", // let the kernel pick a free name
 		OverlayAddrs: []netip.Prefix{netip.MustParsePrefix("192.168.77.1/24")},
 		// Route both the connected prefix (which assigning the OverlayAddr already

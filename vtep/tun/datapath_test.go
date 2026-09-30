@@ -4,12 +4,11 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/netip"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/apoxy-dev/icx"
+	"github.com/apoxy-dev/icx/udp"
 	"github.com/stretchr/testify/require"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -327,24 +326,46 @@ func TestNewValidatesConfig(t *testing.T) {
 	require.Error(t, err, "missing underlay")
 }
 
-// --- Integration: two real *icx.Handler engines over a real loopback UDP
-// underlay, spliced through fake TUN devices. Exercises the full datapath —
-// cross-buffer encap/decap + AEAD + Geneve + the peel/synthesize UDP underlay —
-// end to end, with no kernel TUN device. ---
+// --- Integration: two udpEngine peers over a real loopback UDP underlay,
+// spliced through fake TUN devices. Exercises the full datapath — cross-buffer
+// encap/decap + the peel/synthesize UDP underlay — end to end, with no kernel
+// TUN device. ---
 
-func newPeerHandler(t *testing.T, localIP tcpip.Address, localPort uint16, remoteIP tcpip.Address, remotePort uint16, vni uint) *icx.Handler {
-	t.Helper()
-	h, err := icx.NewHandler(
-		icx.WithLocalAddr(&tcpip.FullAddress{Addr: localIP, Port: localPort}),
-		icx.WithLayer3VirtFrames(),
-	)
-	require.NoError(t, err)
-	prefix := netip.MustParsePrefix("192.168.1.0/24")
-	require.NoError(t, h.AddVirtualNetwork(vni,
-		&tcpip.FullAddress{Addr: remoteIP, Port: remotePort},
-		[]icx.Route{{Src: prefix, Dst: prefix}}))
-	return h
+// udpEngine is a test EngineXfrm without crypto. VirtToPhy puts the inner packet
+// in an outer Ethernet+IPv4+UDP frame from local to remote, and PhyToVirt removes
+// that frame. Like a real decap, PhyToVirt does not bound its output to virt.
+type udpEngine struct {
+	local, remote tcpip.FullAddress
 }
+
+func newUDPEngine(localIP tcpip.Address, localPort uint16, remoteIP tcpip.Address, remotePort uint16) *udpEngine {
+	return &udpEngine{
+		local:  tcpip.FullAddress{Addr: localIP, Port: localPort},
+		remote: tcpip.FullAddress{Addr: remoteIP, Port: remotePort},
+	}
+}
+
+func (e *udpEngine) VirtToPhy(virt, phy []byte) (int, bool) {
+	if udp.PayloadOffsetIPv4+len(virt) > len(phy) {
+		return 0, false
+	}
+	copy(phy[udp.PayloadOffsetIPv4:], virt)
+	n, err := udp.Encode(phy, &e.local, &e.remote, len(virt), true)
+	if err != nil {
+		return 0, false
+	}
+	return n, false
+}
+
+func (e *udpEngine) PhyToVirt(phy, virt []byte) int {
+	payload, err := udp.Decode(phy, nil, true)
+	if err != nil {
+		return 0
+	}
+	return copy(virt[:len(payload)], payload)
+}
+
+func (e *udpEngine) ToPhy(phy []byte) int { return 0 }
 
 func makeInnerIPv4UDP() []byte {
 	b := make([]byte, header.IPv4MinimumSize+header.UDPMinimumSize)
@@ -381,28 +402,18 @@ func makeSizedInnerIPv4(t *testing.T, total int) []byte {
 }
 
 // TestInboundOversizedDecapNoPanic is the regression for the inbound decap-buffer
-// bound: a peer holding the SA key can encapsulate an inner packet larger than the
-// receiver's MTU clamp, and PhyToVirt's AES-GCM Open does not bound its output to
-// the destination buffer. An undersized decap destination would slice out of range
-// (panic) on the decapsulated length. Inbound buffers are phy-sized (maxPhyFrame),
-// so the oversized frame is truncated at the underlay read and dropped by decap
-// auth instead of delivered; the pump must survive it and keep serving in-MTU
-// traffic. The frame is pre-built with a large encap buffer so the APO-667
-// *encap* bound does not drop it, then fed straight to the receiver datapath.
+// bound: a peer can encapsulate an inner packet larger than the receiver's MTU
+// clamp, and PhyToVirt does not bound its output to the destination buffer. An
+// undersized decap destination would slice out of range (panic) on the
+// decapsulated length. Inbound buffers are phy-sized (maxPhyFrame), so the
+// oversized frame is truncated at the underlay read and dropped by decap instead
+// of delivered; the pump must survive it and keep serving in-MTU traffic. The
+// frame is pre-built with a large encap buffer so the *encap* bound does not
+// drop it, then fed straight to the receiver datapath.
 func TestInboundOversizedDecapNoPanic(t *testing.T) {
-	const vni = uint(7)
 	lo := tcpip.AddrFrom4([4]byte{127, 0, 0, 1})
-	hA := newPeerHandler(t, lo, 6081, lo, 6081, vni)
-	hB := newPeerHandler(t, lo, 6081, lo, 6081, vni)
-
-	const spiAB, spiBA = uint32(0x0A0A0A0A), uint32(0x0B0B0B0B)
-	var master [32]byte
-	for i := range master {
-		master[i] = 0xAB
-	}
-	exp := time.Now().Add(time.Hour)
-	require.NoError(t, hA.UpdateVirtualNetworkSecret(vni, master, spiBA, spiAB, exp))
-	require.NoError(t, hB.UpdateVirtualNetworkSecret(vni, master, spiAB, spiBA, exp))
+	hA := newUDPEngine(lo, 6081, lo, 6081)
+	hB := newUDPEngine(lo, 6081, lo, 6081)
 
 	// 4000-byte inner packet: far above the 1280 clamp and the phy-sized
 	// inbound buffer.
@@ -447,28 +458,14 @@ func mustListenUDP(t *testing.T) *net.UDPConn {
 }
 
 func TestDatapathIntegrationRoundTrip(t *testing.T) {
-	const vni = uint(7)
-
 	connA := mustListenUDP(t)
 	connB := mustListenUDP(t)
 	portA := uint16(connA.LocalAddr().(*net.UDPAddr).Port)
 	portB := uint16(connB.LocalAddr().(*net.UDPAddr).Port)
 	lo := tcpip.AddrFrom4([4]byte{127, 0, 0, 1})
 
-	hA := newPeerHandler(t, lo, portA, lo, portB, vni)
-	hB := newPeerHandler(t, lo, portB, lo, portA, vni)
-
-	// Directional SAs: A's TX SPI == B's RX SPI and vice versa; both handlers
-	// derive the per-direction keys from the shared master, and the distinct SPIs
-	// keep the two directions' keys distinct (the seam rejects rxSPI == txSPI).
-	const spiAB, spiBA = uint32(0x0A0A0A0A), uint32(0x0B0B0B0B)
-	var master [32]byte
-	for i := range master {
-		master[i] = 0xAB
-	}
-	exp := time.Now().Add(time.Hour)
-	require.NoError(t, hA.UpdateVirtualNetworkSecret(vni, master, spiBA, spiAB, exp))
-	require.NoError(t, hB.UpdateVirtualNetworkSecret(vni, master, spiAB, spiBA, exp))
+	hA := newUDPEngine(lo, portA, lo, portB)
+	hB := newUDPEngine(lo, portB, lo, portA)
 
 	uuA, err := newUDPUnderlay(connA)
 	require.NoError(t, err)

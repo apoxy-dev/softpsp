@@ -17,11 +17,9 @@ import (
 	"github.com/google/gopacket/pcapgo"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
-	"gvisor.dev/gvisor/pkg/tcpip"
 
 	"github.com/apoxy-dev/icx/filter"
 	"github.com/apoxy-dev/icx/forwarder"
-	"github.com/apoxy-dev/icx/proxyarp"
 	"github.com/apoxy-dev/icx/veth"
 )
 
@@ -64,12 +62,7 @@ func TestForwarder(t *testing.T) {
 	pcapWriter := pcapgo.NewWriter(pcapFile)
 	require.NoError(t, pcapWriter.WriteFileHeader(uint32(math.MaxUint16), layers.LinkTypeEthernet))
 
-	phyMAC, err := tcpip.ParseMACAddress(phyDev.Link.Attrs().HardwareAddr.String())
-	require.NoError(t, err)
-
-	h := &pipe{
-		proxyARP: proxyarp.NewProxyARP(phyMAC),
-	}
+	h := &pipe{}
 
 	// Create the forwarder.
 	fwd, err := forwarder.NewForwarder(h,
@@ -175,9 +168,7 @@ func TestHTTPServerHelper(t *testing.T) {
 }
 
 // Simple handler implementation that just copies data between phy and virt.
-type pipe struct {
-	proxyARP *proxyarp.ProxyARP
-}
+type pipe struct{}
 
 // The pipe is an identity transform: it forwards each frame unchanged, so the
 // in-place methods just return the input window. This exercises the shared-UMEM

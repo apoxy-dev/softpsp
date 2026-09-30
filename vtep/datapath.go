@@ -1,6 +1,6 @@
-// Package vtep defines the seam between the ICX engine (encap/decap + crypto,
-// implemented by *icx.Handler) and the I/O driver that moves frames between the
-// engine and the outside world. One engine drives many driver shapes:
+// Package vtep defines the contract between the engine (encap/decap + crypto)
+// and the I/O driver that moves frames between the engine and the outside
+// world. One engine drives many driver shapes:
 //
 //   - afxdp    veth + driver-XDP NIC, zero-copy, privileged. Drives the engine
 //     through the in-place forwarder.Handler contract. Used for the per-node /
@@ -20,8 +20,6 @@ package vtep
 import (
 	"context"
 	"io"
-
-	"github.com/apoxy-dev/icx"
 )
 
 // Datapath is one VTEP I/O driver. It pumps frames through the engine between
@@ -47,9 +45,7 @@ type Datapath interface {
 // transformed frame into a distinct buffer, which suits drivers that cannot
 // share a single UMEM with the NIC. It is byte-for-byte equivalent to the
 // in-place forwarder.Handler contract that the zero-copy afxdp driver uses;
-// keeping the two equivalent is a maintained invariant (see cp_wire tests).
-//
-// *icx.Handler satisfies this interface — see the assertion below.
+// keeping the two equivalent is a maintained invariant.
 type EngineXfrm interface {
 	// PhyToVirt decapsulates a physical (underlay) frame into virt, returning
 	// the number of bytes written, or 0 to drop.
@@ -65,8 +61,3 @@ type EngineXfrm interface {
 	// to send.
 	ToPhy(phy []byte) int
 }
-
-// Compile-time guarantee that the ICX engine satisfies the cross-buffer seam.
-// If the engine's signatures drift, this fails to build rather than silently
-// diverging from the driver contract.
-var _ EngineXfrm = (*icx.Handler)(nil)
