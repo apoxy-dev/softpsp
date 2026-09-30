@@ -3,13 +3,13 @@
 
 // Package tun implements the tun VTEP datapath driver: it splices a kernel
 // /dev/net/tun device (the overlay-side, L3 link the consumer routes to) to the
-// ICX engine, moving encap'd frames over a UDP-socket underlay.
+// engine, moving encap'd frames over a UDP-socket underlay.
 //
 // It is the kernel-device, NET_ADMIN-only driver of the vtep family. Unlike the
 // netstack driver — which is handed both its endpoint and underlay by the
 // consumer and only drives the pump — the tun driver OWNS both the TUN device
 // and the UDP socket and tears them down on Close (see vtep.Datapath). This is
-// the consumer-locality seam for a normal kernel-socket process (Envoy on the
+// the consumer-locality case for a normal kernel-socket process (Envoy on the
 // backplane): the overlay consumer reaches overlay backends by kernel route, so
 // the VTEP must present a kernel device it can route to.
 //
@@ -46,9 +46,9 @@ const (
 	defaultFlushInterval = 100 * time.Millisecond
 
 	// defaultInnerMTU is the mandatory static inner-MTU clamp for a software/TUN
-	// VTEP. icx has no PMTUD, so an inner packet whose encapsulated size exceeds
+	// VTEP. The engine has no PMTUD, so an inner packet whose encapsulated size exceeds
 	// the underlay path MTU would be black-holed; 1280 (the IPv6 minimum MTU) is
-	// the universally safe floor (seam doc Risk 3 / APO-794).
+	// the universally safe floor.
 	defaultInnerMTU = 1280
 
 	// rxFrameSlack is extra room in an inbound phy buffer beyond the largest
@@ -133,9 +133,8 @@ type BatchUnderlay interface {
 
 // Config configures a Datapath. Engine, Device and Underlay are required.
 type Config struct {
-	// Engine is the ICX engine performing encap/decap + crypto. *icx.Handler
-	// satisfies this; it must be configured in layer3 mode (WithLayer3VirtFrames),
-	// since the TUN device carries raw L3 inner packets.
+	// Engine does the encap/decap and the crypto. It must be configured in
+	// layer3 mode, since the TUN device carries raw L3 inner packets.
 	Engine vtep.EngineXfrm
 	// Device is the overlay-side TUN device. The driver owns it and closes it on
 	// Close.
@@ -155,7 +154,7 @@ type Config struct {
 	FlushInterval time.Duration
 }
 
-// Datapath splices a TUN device to the ICX engine over a UDP underlay. It
+// Datapath splices a TUN device to the engine over a UDP underlay. It
 // implements vtep.Datapath.
 type Datapath struct {
 	engine   vtep.EngineXfrm
@@ -280,7 +279,7 @@ func (d *Datapath) outbound() error {
 	// Size the encap buffer for the largest inner packet the read buffer can admit
 	// (innerMTU+tunHeadroom) plus the outer/Geneve/tag overhead, so a packet in the
 	// (innerMTU, innerMTU+tunHeadroom] range encaps instead of being dropped by the
-	// VirtToPhy (APO-667) bound.
+	// VirtToPhy bound.
 	encBufLen := d.innerMTU + tunHeadroom + encapHeadroom
 
 	readBufs := make([][]byte, bs)

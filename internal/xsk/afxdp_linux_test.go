@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 //go:build linux
 
@@ -276,7 +277,7 @@ func TestAFXDP_SharedUMEMCrossDev(t *testing.T) {
 	}
 }
 
-// TestAFXDP_TxDrainBeyondBatch exercises the copy-mode TX drain (APO-801) and
+// TestAFXDP_TxDrainBeyondBatch exercises the copy-mode TX drain and
 // proves Socket.Kick keeps the ring moving past the kernel's per-sendto batch
 // limit. In copy/generic mode the kernel pulls at most TX_BATCH_SIZE — 32 —
 // descriptors off the TX ring per sendto and never pulls on its own, so the

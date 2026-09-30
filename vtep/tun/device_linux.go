@@ -26,7 +26,8 @@ const tunDeviceOffset = 16
 
 // OpenConfig configures Open. Engine, Name and UnderlayBind are required.
 type OpenConfig struct {
-	// Engine is the ICX engine; it must be configured in layer3 mode.
+	// Engine does the encap/decap and the crypto; it must be configured in
+	// layer3 mode.
 	Engine vtep.EngineXfrm
 	// Name is the TUN interface name to create (e.g. "icx0"). An empty name lets
 	// the kernel pick one.

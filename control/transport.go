@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 package control
 
@@ -179,7 +180,7 @@ func newSession(ctx context.Context, conn *quic.Conn, role Role) (*Session, erro
 	mk, err := DeriveMasterKeys(root)
 	// Wipe the exported root secret as soon as the master keys are derived: it is
 	// the single seed from which every master and SA key flows, so shrinking its
-	// lifetime to this function bounds the disclosure window (APO-658). Go's GC may
+	// lifetime to this function bounds the disclosure window. Go's GC may
 	// have copied it, so this is best-effort defense-in-depth, not a guarantee.
 	clear(root)
 	if err != nil {

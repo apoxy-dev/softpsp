@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 //go:build linux
 
@@ -49,7 +50,7 @@ type Options struct {
 	// on the calling core, instead of waiting for the NIC IRQ's RX softirq to run
 	// on its own (IRQ-affined) core. It is the AF_XDP analogue of a DPDK poll-mode
 	// driver and removes the IRQ-core contention a pinned datapath thread
-	// otherwise hits (APO-670). The value is the SO_BUSY_POLL timeout in
+	// otherwise hits. The value is the SO_BUSY_POLL timeout in
 	// microseconds (a value around 20 is typical). The per-netdev
 	// napi_defer_hard_irqs/gro_flush_timeout knobs that make the IRQ deferral
 	// actually engage are set out of band (the forwarder does it); without them
@@ -67,8 +68,8 @@ type Options struct {
 // kernel's Documentation/networking/af_xdp.rst busy-poll example.
 const DefaultBusyPollBudget = 64
 
-// DefaultOptions mirror sane high-throughput defaults (icx currently uses
-// NumFrames=8192, FrameSize=2048, all rings=4096).
+// DefaultOptions are high-throughput defaults: NumFrames=8192, FrameSize=2048
+// and 4096 descriptors in each ring.
 var DefaultOptions = Options{
 	NumFrames:              8192,
 	FrameSize:              2048,

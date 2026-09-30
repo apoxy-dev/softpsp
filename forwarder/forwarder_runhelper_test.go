@@ -25,7 +25,7 @@ import (
 // detector flags and a real use-after-free. The single-queue tests hid it (one
 // goroutine, usually already exited by cleanup time); the multiqueue datapath
 // makes the overlap reliable. Production never hits it (cli drives Start via the
-// vtep seam and never calls Close concurrently — Start self-closes on return).
+// vtep contract and never calls Close concurrently — Start self-closes on return).
 func runForwarder(t *testing.T, fwd *forwarder.Forwarder) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())

@@ -2,7 +2,7 @@
 // Apoxy changed this file for softpsp.
 
 // Package netstack implements the netstack VTEP datapath driver: it splices a
-// gVisor channel.Endpoint (the overlay-side, userspace L3 link) to the ICX
+// gVisor channel.Endpoint (the overlay-side, userspace L3 link) to the
 // engine, moving encap'd frames over an injected underlay transport.
 //
 // It is the unprivileged, software-only driver of the vtep family. The driver
@@ -15,7 +15,7 @@
 //     supplies its own UDP underlay socket.
 //
 // Both consume the same engine + pump; only the stack construction and the
-// underlay differ. This is the consumer-locality seam: the overlay consumer
+// underlay differ. This is the consumer-locality case: the overlay consumer
 // lives inside a userspace netstack, so the driver is software.
 package netstack
 
@@ -70,8 +70,8 @@ type Underlay interface {
 
 // Config configures a Datapath. Engine, Endpoint and Underlay are required.
 type Config struct {
-	// Engine is the ICX engine performing encap/decap + crypto. *icx.Handler
-	// satisfies this; it must be configured in layer3 mode.
+	// Engine does the encap/decap and the crypto. It must be configured in
+	// layer3 mode.
 	Engine vtep.EngineXfrm
 	// Endpoint is the overlay-side gVisor link endpoint. The consumer owns the
 	// enclosing stack.Stack and NIC; the datapath only reads/injects frames.
@@ -83,7 +83,7 @@ type Config struct {
 	FlushInterval time.Duration
 }
 
-// Datapath splices a channel.Endpoint to the ICX engine over an underlay. It
+// Datapath splices a channel.Endpoint to the engine over an underlay. It
 // implements vtep.Datapath.
 type Datapath struct {
 	engine   vtep.EngineXfrm

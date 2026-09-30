@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 package control
 
@@ -344,7 +345,7 @@ func (s *Session) roundTrip(ctx context.Context, payload []byte) ([]byte, error)
 	return resp, nil
 }
 
-// KeyGranter is the responder's policy seam. Grant must atomically allocate a
+// KeyGranter is the responder's policy hook. Grant must atomically allocate a
 // VNI for addr and install the responder-side SAs (sas.RxSPI decrypts traffic
 // arriving FROM the peer's network, sas.TxSPI encrypts traffic sent back TO it;
 // the handler derives both keys from sas.Master)

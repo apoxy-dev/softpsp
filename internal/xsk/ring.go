@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 //go:build linux
 
@@ -150,7 +151,7 @@ func (r *ring) available() uint32 {
 // refreshed cachedConsumer when free hit exactly 0, so once the kernel partially
 // drained the ring and the producer went idle, cachedConsumer went stale and the
 // derived counts froze (free reading ~1 forever, NumTransmitted ~size-1 forever)
-// — silently starving the reservation logic and wedging the datapath (APO-803).
+// — silently starving the reservation logic and wedging the datapath.
 // The kernel only ever advances the consumer (monotonic, frees space), so an
 // unconditional acquiring load can only move free up and never reads torn — it is
 // always correct, and the extra cacheline read per call is negligible next to the

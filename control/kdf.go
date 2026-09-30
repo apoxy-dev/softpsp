@@ -17,7 +17,7 @@ import "github.com/apoxy-dev/softpsp/psp"
 type ICXVersion = psp.ICXVersion
 
 const (
-	// AESGCM128 selects AES-GCM-128: a 16-byte SA key. The ICX default.
+	// AESGCM128 selects AES-GCM-128: a 16-byte SA key. The default.
 	AESGCM128 = psp.AESGCM128
 	// AESGCM256 selects AES-GCM-256: a 32-byte SA key. The CNSA / 256-bit path.
 	AESGCM256 = psp.AESGCM256

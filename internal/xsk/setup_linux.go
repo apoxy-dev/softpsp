@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 //go:build linux
 
@@ -267,8 +268,8 @@ func NewSocket(umem *UMEM, ifindex, queueID int, opts Options) (*Socket, error) 
 // busy poll, a poll()/recvmsg() on this socket drives the bound netdev's NAPI
 // inline on the calling core (the AF_XDP analogue of a DPDK poll-mode driver)
 // instead of waiting for the NIC IRQ's RX softirq to run on its own core, which
-// removes the IRQ-core contention a pinned datapath thread otherwise hits
-// (APO-670). It is a no-op when busy poll is disabled, so the default datapath is
+// removes the IRQ-core contention a pinned datapath thread otherwise hits.
+// It is a no-op when busy poll is disabled, so the default datapath is
 // untouched.
 //
 // Requires Linux >= 5.11: SO_PREFER_BUSY_POLL/SO_BUSY_POLL_BUDGET do not exist on

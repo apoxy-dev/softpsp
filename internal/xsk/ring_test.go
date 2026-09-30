@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 //go:build linux
 
@@ -339,7 +340,7 @@ func TestRingFreeAndAvailable(t *testing.T) {
 	// cached count hit exactly 0, so a partial drain left freeSlots — and the
 	// NumFreeTxSlots/NumFilled/NumTransmitted derived from it — frozen at a stale
 	// value once the producer went idle, starving the forwarder's flow control and
-	// wedging the datapath. APO-803.)
+	// wedging the datapath.)
 	*cons = 4
 	if f := r.freeSlots(); f != 10 {
 		t.Fatalf("freeSlots after kernel drained 4 = %d, want 10 (always refreshes)", f)

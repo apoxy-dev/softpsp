@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 // Package psp implements the PSP-model cryptographic primitives shared by the
-// icx data plane (package icx) and the key-establishment control plane
+// data plane and the key-establishment control plane
 // (package control): the NIST SP 800-108 / AES-CMAC key-derivation function
 // from the PSP Architecture Specification, and the SPI bit layout that
 // partitions the derivation space by master key and allocating role.
@@ -23,8 +24,8 @@ import (
 type ICXVersion uint8
 
 const (
-	// AESGCM128 selects AES-GCM-128: a 16-byte SA key. The ICX default (zero
-	// churn to the [16]byte data plane).
+	// AESGCM128 selects AES-GCM-128: a 16-byte SA key. The default (no
+	// change to the [16]byte data plane).
 	AESGCM128 ICXVersion = 0
 	// AESGCM256 selects AES-GCM-256: a 32-byte SA key. The CNSA / 256-bit path.
 	AESGCM256 ICXVersion = 1

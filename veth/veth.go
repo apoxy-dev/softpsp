@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 //go:build linux
 
@@ -110,7 +111,7 @@ func Create(name string, numQueues, mtu int) (*Handle, error) {
 	// checksum offload, and only on veth.Name — leaving GSO/GRO/TSO/LRO on and the
 	// peer untouched. With segmentation/aggregation offload on, the veth hands the
 	// AF_XDP socket 64 KiB super-frames that overflow the 2 KiB UMEM frame, so bulk
-	// TCP silently drops while small packets/pings survive (APO-802). The XDP path
+	// TCP silently drops while small packets/pings survive. The XDP path
 	// also needs checksum offload off because the encap works on raw bytes.
 	if err := disableOffloads(ethHandle, veth.Name); err != nil {
 		_ = h.Close()
@@ -138,7 +139,7 @@ func Create(name string, numQueues, mtu int) (*Handle, error) {
 // datapath. Checksum offload must be off because the in-place encap rewrites raw
 // bytes; the segmentation/aggregation offloads (GSO/GRO/TSO/LRO/USO) must be off
 // because with them on the stack hands the AF_XDP socket frames far larger than
-// one UMEM frame, which the datapath cannot represent (APO-802). Names are the
+// one UMEM frame, which the datapath cannot represent. Names are the
 // kernel ethtool feature strings (as in `ethtool -k`), not the short -K flags.
 var offloadsToDisable = []string{
 	// checksum

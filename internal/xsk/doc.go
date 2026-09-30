@@ -1,24 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 //go:build linux
 
 // Package xsk is an in-repo AF_XDP (XSK) socket implementation, written to
 // replace github.com/slavc/xdp v0.3.4. It exists because the upstream binding
-// has structural correctness defects that cannot be patched without a redesign,
-// and because icx wants shared-UMEM zero-copy forwarding, which the upstream
+// has correctness defects in its design that cannot be patched without a
+// redesign, and because softpsp needs shared-UMEM zero-copy forwarding, which the upstream
 // UMEM-per-socket model does not support.
 //
 // # Why a rewrite (vs forking slavc/xdp)
 //
-// icx uses only a thin slice of the upstream API: the Socket datapath
+// softpsp uses only a thin slice of the upstream API: the Socket datapath
 // (GetDescs/GetFrame/Fill/Receive/Transmit/Complete/Num*) from the forwarder,
 // and xdp.Program purely as a struct of {*ebpf.Program, qidconf map, xsks map}
 // with Attach/Detach/Register glue (filter.go builds it by hand from a cilium
 // collection). The upstream NewProgram eBPF-asm program is unused. The defects
-// that matter are all structural:
+// that matter are all in the design:
 //
 //   - ring producer/consumer indices accessed via plain (non-atomic) *uint32
-//     dereferences of kernel-shared mmap memory, with every memory fence
+//     dereferences of kernel-shared mmap memory, with every memory barrier
 //     commented out -> works by luck on x86-64 TSO, data corruption on ARM64,
 //     and a compiler hoist/cache hazard on every architecture;
 //   - UMEM owned per-socket + an RX/TX "half partition" freelist, which forces
@@ -37,7 +38,7 @@
 // detector cannot observe the kernel, so these accesses MUST be explicitly
 // ordered. This package follows the libbpf xsk.h discipline exactly, using
 // sync/atomic (which on Go gives acquire/release and also defeats compiler
-// caching/hoisting, unlike re-enabling an arch-specific asm fence):
+// caching/hoisting, unlike re-enabling an arch-specific asm barrier):
 //
 //   - producer reserve: load-ACQUIRE the consumer index to compute free space;
 //   - producer submit:  write descriptors, THEN store-RELEASE the producer index;

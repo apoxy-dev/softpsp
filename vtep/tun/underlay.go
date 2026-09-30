@@ -146,7 +146,7 @@ func peel(frame []byte) ([]byte, netip.AddrPort, error) {
 // skip-checksum) ignores them, validating only the length fields, and PhyToVirt
 // selects the SA by Geneve SPI. The outer source address, however, is
 // meaningful: it carries the REAL received peer, which is exactly what the
-// engine adopts under WithSourceLearning (APO-740). Both outer src and dst are
+// engine adopts when source learning is on. Both outer src and dst are
 // set to peer, which trivially keeps the address families equal as udp.Encode
 // requires.
 func synthesize(buf []byte, payloadAt, payloadLen int, peer netip.AddrPort) (int, error) {

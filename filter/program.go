@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 //go:build linux
 
@@ -15,8 +16,8 @@ import (
 
 // AttachFlags are the flags passed when attaching the XDP program to an
 // interface. Zero lets the kernel choose the attach mode (native driver XDP if
-// the driver supports it, otherwise generic/SKB), matching the behaviour icx
-// inherited from github.com/slavc/xdp.
+// the driver supports it, otherwise generic/SKB), matching the behaviour of
+// github.com/slavc/xdp.
 //
 // IMPORTANT: on drivers that support native XDP (e.g. ixgbe), the kernel's
 // default (native) attach RECONFIGURES the NIC's TX rings, and copy-mode AF_XDP
@@ -33,7 +34,7 @@ var AttachFlags = 0
 // map (qidconf_map) that gates which RX queues redirect, and the XSKMAP
 // (xsks_map) that maps a queue index to a bound socket fd.
 //
-// This replaces github.com/slavc/xdp's Program type: icx built it by hand from a
+// This replaces github.com/slavc/xdp's Program type: the old code built it by hand from a
 // cilium/ebpf collection (see All/Geneve) and only ever used Attach/Detach/
 // Register/Unregister/Close, so the in-repo version carries just those, with no
 // dependency on the upstream library.

@@ -37,8 +37,8 @@ import (
 // and returns the (offset, length) window of the output packet within the SAME
 // buffer. The output overlaps the input — no copy between separate buffers — so a
 // frame received on one socket is transformed and transmitted on the other
-// without ever leaving the UMEM. *icx.Handler implements this; its in-place
-// transforms are byte-for-byte equivalent to the cross-buffer ones (kept for
+// without ever leaving the UMEM. The in-place transforms of an engine must be
+// byte-for-byte equivalent to its cross-buffer ones (vtep.EngineXfrm, kept for
 // non-zero-copy callers).
 type Handler interface {
 	// PhyToVirtInPlace converts a physical frame to a virtual frame (typically
@@ -121,7 +121,7 @@ func WithPhyFilter(prog *filter.Program) ForwarderOption {
 // (LockOSThread'd) OS thread to a distinct CPU drawn from the process's allowed
 // affinity mask. Enabled by default: the per-queue loops are long-lived busy
 // pollers, so keeping each one resident on one core cuts the cross-core cache and
-// scheduler churn the unpinned default incurred (APO-670). Disable it on
+// scheduler churn the unpinned default incurred. Disable it on
 // oversubscribed or shared hosts where the dedicated-core assumption does not
 // hold.
 func WithCPUPinning(enabled bool) ForwarderOption {
@@ -157,7 +157,7 @@ func WithNumQueues(n int) ForwarderOption {
 // Close), it is the AF_XDP equivalent of a DPDK poll-mode driver: the RX path no
 // longer needs the IRQ core at all. That removes the contention which made a
 // naively pinned datapath thread (WithCPUPinning) collapse ~10x when it landed on
-// the NIC RX softirq core (APO-670). Like CPU pinning, busy poll burns the core
+// the NIC RX softirq core. Like CPU pinning, busy poll burns the core
 // at 100%, so enable it only on a dedicated datapath host. Requires Linux >= 5.11.
 func WithBusyPoll(usecs, budget int) ForwarderOption {
 	return func(o *forwarderOptions) error {
@@ -189,10 +189,10 @@ var socketOpts = xsk.Options{
 // phySockOpts returns the bind options for the FIRST (phy) socket. On a
 // zero-copy-capable NIC (mlx5/ixgbe), a best-effort bind grabs driver zero-copy
 // and DMA-maps the shared UMEM to the phy, after which the shared virt (veth)
-// bind fails EOPNOTSUPP (APO-800). Pinning the phy to XDP_COPY keeps the UMEM
+// bind fails EOPNOTSUPP. Pinning the phy to XDP_COPY keeps the UMEM
 // shareable across both sockets, which the in-place handoff datapath requires.
 // Busy poll (if enabled) applies to the phy socket too — it is the NIC RX path
-// whose softirq otherwise contends with a pinned datapath thread (APO-670).
+// whose softirq otherwise contends with a pinned datapath thread.
 func (f *Forwarder) phySockOpts() xsk.Options {
 	so := socketOpts
 	so.ForceCopy = true
@@ -227,7 +227,7 @@ const (
 // the application's busy poll to drive the next one — moving the RX softirq off
 // its own IRQ-affined core onto the datapath thread's core. Without them
 // SO_PREFER_BUSY_POLL still busy-polls, but the hard IRQ keeps firing in parallel
-// and the IRQ-core contention busy poll is meant to remove (APO-670) persists.
+// and the IRQ-core contention busy poll is meant to remove persists.
 //
 // Best-effort: a read/write failure is logged, not fatal (the per-socket
 // setsockopts are the real contract; this is host tuning, and some virtual
@@ -284,7 +284,7 @@ var maxTxDrainKicks = socketOpts.TxRingNumDescs/txBatchSize + 1
 // kernel stops accepting descriptors (sndbuf / completion-ring full — the next
 // Complete frees that). Without it, a single post-Transmit kick submits only
 // txBatchSize frames to the driver and the rest of the batch is stranded once the
-// producer goes idle: the ~288-frame copy-mode stall (APO-801). It is a cheap
+// producer goes idle: the ~288-frame copy-mode stall. It is a cheap
 // no-op (one ring read) when the TX ring is empty, and elides its kicks when the
 // socket is draining under NEED_WAKEUP.
 func flushTx(s *xsk.Socket) error {
@@ -338,10 +338,10 @@ type Forwarder struct {
 	// between them possible. Each is Closed exactly once, after both its sockets.
 	umems     []*xsk.UMEM
 	closeOnce sync.Once
-	// pinCPU pins each per-queue goroutine's OS thread to a distinct CPU (APO-670).
+	// pinCPU pins each per-queue goroutine's OS thread to a distinct CPU.
 	pinCPU bool
 	// busyPoll (>0) enables AF_XDP socket busy poll at this SO_BUSY_POLL timeout in
-	// microseconds; busyPollBudget caps the per-pass NAPI budget (APO-670).
+	// microseconds; busyPollBudget caps the per-pass NAPI budget.
 	busyPoll       int
 	busyPollBudget int
 	// napiDeferRestore holds closures that put the per-netdev NAPI-defer sysfs
@@ -361,7 +361,7 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 
 	// The forwarder's virtual interface is an L2 device (a veth): its in-place
 	// transforms write Ethernet-framed packets to/from it. A handler in layer3
-	// mode (WithLayer3VirtFrames) instead emits a raw IP packet on decap, which
+	// mode instead emits a raw IP packet on decap, which
 	// the veth silently drops — the datapath wedges to zero with no error. Reject
 	// it at construction rather than blackholing at runtime. An L3 peer (the
 	// userspace vtep/tun datapath) still interoperates with this forwarder on the
@@ -369,7 +369,7 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 	// regardless of the remote peer's local framing.
 	if l3, ok := handler.(interface{ IsLayer3() bool }); ok && l3.IsLayer3() {
 		return nil, fmt.Errorf("forwarder requires an L2 handler: its virtual interface is an Ethernet veth, " +
-			"but the handler is configured for layer3 (WithLayer3VirtFrames); drop WithLayer3VirtFrames " +
+			"but the handler is configured for layer3; use a handler in L2 mode " +
 			"(L3 peers such as the userspace vtep/tun datapath still interoperate on the wire)")
 	}
 
@@ -379,14 +379,14 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 
 	// Attach the RX-redirect programs in SKB/generic mode. The shared-UMEM
 	// datapath runs in copy mode (phyBindOpts forces XDP_COPY so the UMEM stays
-	// shareable across the phy and virt sockets — APO-800). On a native-XDP-capable
+	// shareable across the phy and virt sockets). On a native-XDP-capable
 	// NIC (e.g. ixgbe) a NATIVE-mode redirect program reconfigures the driver's TX
 	// rings, and copy-mode AF_XDP TX frames then never reach the wire — the driver
 	// silently drops them while still producing completions (proven on real ixgbe:
 	// with a native program nic_tx_delta=0 at 934k "completed"/s; in SKB mode the
 	// same blast egresses 934k pps). SKB mode runs the redirect in the generic XDP
 	// hook, leaving the driver's TX path untouched, and still steers RX into the
-	// AF_XDP sockets — which is all the copy-mode datapath needs. (APO-803.)
+	// AF_XDP sockets — which is all the copy-mode datapath needs.
 	filter.AttachFlags = unix.XDP_FLAGS_SKB_MODE
 
 	phyLink, err := netlink.LinkByName(options.phyName)
@@ -615,7 +615,7 @@ func (f *Forwarder) Start(ctx context.Context) error {
 	// so every per-queue goroutine pins against the same full set. Reading it
 	// inside each goroutine would be fragile: a worker thread the Go runtime
 	// recycles from an already-pinned one would see a narrowed mask and mis-spread.
-	// nil (pinning off or mask unreadable) leaves all queues unpinned (APO-670).
+	// nil (pinning off or mask unreadable) leaves all queues unpinned.
 	var pinCPUs []int
 	if f.pinCPU {
 		pinCPUs = allowedCPUs()
@@ -667,7 +667,7 @@ func allowedCPUs() []int {
 // runtime.LockOSThread) to cpus[queueID mod len], so a per-queue datapath loop
 // keeps its UMEM rings and working set resident on one core instead of migrating
 // between them — cutting the cross-core cache traffic and scheduler churn the
-// unpinned busy loop otherwise incurred (APO-670). cpus is the snapshot from
+// unpinned busy loop otherwise incurred. cpus is the snapshot from
 // allowedCPUs, so the target is always inside the inherited cpuset (container
 // safe). Best-effort: a failure is logged and the thread left unpinned, never
 // failing the datapath.
@@ -731,7 +731,7 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int, pinCPUs []in
 		// Drive any queued copy-mode TX out to the driver before sleeping in poll.
 		// The kernel pulls only txBatchSize descriptors per kick and never on its
 		// own, so a batch larger than that — or any tail left after the producer
-		// goes idle — needs repeated kicks or it strands in the ring (APO-801).
+		// goes idle — needs repeated kicks or it strands in the ring.
 		if err := flushTx(phy); err != nil {
 			return fmt.Errorf("failed to drain phy TX: %w", err)
 		}
@@ -747,7 +747,7 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int, pinCPUs []in
 		// lets the softirq/NAPI producing those TX completions run. poll() therefore
 		// does not arm POLLOUT for a not-full TX ring (which the kernel reports
 		// ready at < 50% full, collapsing the sleep to ~0 and starving the
-		// completion softirq — APO-803). Otherwise sleep until RX-readable or 100ms.
+		// completion softirq). Otherwise sleep until RX-readable or 100ms.
 		timeout := 100 * time.Millisecond
 		if phy.NumTransmitted() > 0 || virt.NumTransmitted() > 0 {
 			timeout = time.Millisecond
@@ -772,7 +772,7 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int, pinCPUs []in
 		// returns at most ONE network's keep-alive per call, so emitting once per loop
 		// served N due networks only one-per-poll — up to N x the idle poll quantum
 		// (100ms) of latency on the Nth network's keep-alive, long enough to let its
-		// NAT mapping lapse on an otherwise idle queue (APO-679). Drain until nothing
+		// NAT mapping lapse on an otherwise idle queue. Drain until nothing
 		// is due (outLen == 0) or the phy TX ring fills: the loop is bounded by the
 		// number of due networks and the free TX slots, and a network that cannot send
 		// (no installed/expired key, counter overflow) yields outLen == 0, so it stops
@@ -783,7 +783,7 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int, pinCPUs []in
 		// and its serviced-store are not atomic across goroutines — so running this
 		// in all N processFrames goroutines made each due network's keep-alive egress
 		// up to N times per interval and burn N transmit-counter values toward the
-		// rekey threshold (APO-670). Gating to one queue restores exactly one
+		// rekey threshold. Gating to one queue restores exactly one
 		// keep-alive per network per interval regardless of queue count.
 		for queueID == 0 && phy.NumFreeTxSlots() > 0 {
 			schedScratch = umem.Alloc(schedScratch[:0], 1)
@@ -1038,7 +1038,7 @@ func poll(phy, virt *xsk.Socket, timeout time.Duration) (err error) {
 	// < 50% full, so arming it here makes poll() return immediately under TX
 	// back-pressure (ring barely full, sndbuf saturated) — defeating the CPU
 	// yield this poll exists to perform and busy-spinning the pinned datapath
-	// thread, which starves the softirq that completes copy-mode TX (APO-803).
+	// thread, which starves the softirq that completes copy-mode TX.
 	// We drive the TX ring with explicit kicks (flushTx), not POLLOUT, so the
 	// only thing POLLOUT would buy is a wakeup on TX-ring space — and the timeout
 	// already bounds that.

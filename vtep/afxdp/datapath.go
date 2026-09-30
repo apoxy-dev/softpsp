@@ -4,7 +4,7 @@
 //go:build linux
 
 // Package afxdp adapts the zero-copy AF_XDP forwarder.Forwarder to the
-// vtep.Datapath seam. It is the privileged, kernel-zero-copy driver of the vtep
+// vtep.Datapath interface. It is the privileged, kernel-zero-copy driver of the vtep
 // family (veth + driver-XDP NIC, shared UMEM, in-place transform), used for the
 // per-node / tunnelproxy VTEP where the overlay consumer is the host kernel.
 //

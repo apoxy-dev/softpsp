@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 //go:build linux
 
@@ -147,7 +148,7 @@ func (s *Socket) Transmit(descs []Desc) (int, error) {
 // pulls on its own, so after a Transmit larger than 32 the tail of the batch is
 // still queued; the producer goroutine MUST keep kicking until the ring drains or
 // those descriptors (and the UMEM frames they reference) are stranded — the pool
-// bleeds out and the datapath wedges after the first burst (APO-801). Returns the
+// bleeds out and the datapath wedges after the first burst. Returns the
 // same errno class as the implicit kick inside Transmit. When the socket is bound
 // with NEED_WAKEUP and the kernel is already draining, it elides to a no-op.
 func (s *Socket) Kick() error { return s.kick() }
