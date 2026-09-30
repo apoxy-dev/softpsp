@@ -1,12 +1,10 @@
-module github.com/apoxy-dev/icx
+module github.com/apoxy-dev/softpsp
 
-go 1.24.3
+go 1.26.8
 
 require (
-	github.com/avast/retry-go/v4 v4.6.1
 	github.com/cilium/ebpf v0.18.0
 	github.com/google/gopacket v1.1.19
-	github.com/phemmer/go-iptrie v0.0.0-20240326174613-ba542f5282c9
 	github.com/quic-go/quic-go v0.59.1
 	github.com/safchain/ethtool v0.6.1
 	github.com/stretchr/testify v1.11.1

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apoxy-dev/icx/forwarder"
+	"github.com/apoxy-dev/softpsp/forwarder"
 )
 
 // runForwarder starts fwd under a cancellable context and registers a cleanup

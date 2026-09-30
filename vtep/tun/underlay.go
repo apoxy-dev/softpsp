@@ -7,7 +7,7 @@ import (
 	"net"
 	"net/netip"
 
-	"github.com/apoxy-dev/icx/udp"
+	"github.com/apoxy-dev/softpsp/udp"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )

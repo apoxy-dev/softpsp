@@ -14,8 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/apoxy-dev/icx/forwarder"
-	"github.com/apoxy-dev/icx/veth"
+	"github.com/apoxy-dev/softpsp/forwarder"
+	"github.com/apoxy-dev/softpsp/veth"
 )
 
 // TestForwarderMultiQueue drives the REAL AF_XDP decap datapath through a

@@ -18,8 +18,8 @@ package afxdp
 import (
 	"context"
 
-	"github.com/apoxy-dev/icx/forwarder"
-	"github.com/apoxy-dev/icx/vtep"
+	"github.com/apoxy-dev/softpsp/forwarder"
+	"github.com/apoxy-dev/softpsp/vtep"
 )
 
 // Datapath wraps a *forwarder.Forwarder so it satisfies vtep.Datapath. The

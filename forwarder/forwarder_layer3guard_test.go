@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/apoxy-dev/icx/forwarder"
+	"github.com/apoxy-dev/softpsp/forwarder"
 )
 
 // layer3Pipe is the identity pipe handler set to layer3 mode.

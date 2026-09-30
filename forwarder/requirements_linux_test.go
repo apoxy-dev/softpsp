@@ -7,7 +7,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/apoxy-dev/icx/permissions"
+	"github.com/apoxy-dev/softpsp/permissions"
 )
 
 // requireForwarderEnv skips the test when the host cannot run the AF_XDP

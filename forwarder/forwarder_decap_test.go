@@ -13,9 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 
-	"github.com/apoxy-dev/icx/filter"
-	"github.com/apoxy-dev/icx/forwarder"
-	"github.com/apoxy-dev/icx/veth"
+	"github.com/apoxy-dev/softpsp/filter"
+	"github.com/apoxy-dev/softpsp/forwarder"
+	"github.com/apoxy-dev/softpsp/veth"
 )
 
 // TestForwarderDecapRoundTrip drives a decap handler (decapPipe) through the

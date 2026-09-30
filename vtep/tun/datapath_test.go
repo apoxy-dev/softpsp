@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apoxy-dev/icx/udp"
+	"github.com/apoxy-dev/softpsp/udp"
 	"github.com/stretchr/testify/require"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"

@@ -11,7 +11,7 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/stretchr/testify/require"
 
-	"github.com/apoxy-dev/icx/udp"
+	"github.com/apoxy-dev/softpsp/udp"
 )
 
 // testUnderlayPort is the outer UDP destination port of the test frames. The

@@ -8,7 +8,7 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/apoxy-dev/icx/vtep"
+	"github.com/apoxy-dev/softpsp/vtep"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	wgtun "golang.zx2c4.com/wireguard/tun"

@@ -5,7 +5,7 @@ package forwarder
 import (
 	"testing"
 
-	"github.com/apoxy-dev/icx/internal/xsk"
+	"github.com/apoxy-dev/softpsp/internal/xsk"
 )
 
 // TestWithBusyPollPlumbing checks that WithBusyPoll records the timeout/budget and

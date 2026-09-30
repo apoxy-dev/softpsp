@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 
-	"github.com/apoxy-dev/icx/queues"
+	"github.com/apoxy-dev/softpsp/queues"
 )
 
 func TestNumQueues(t *testing.T) {

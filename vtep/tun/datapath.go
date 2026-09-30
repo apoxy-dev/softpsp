@@ -33,7 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/apoxy-dev/icx/vtep"
+	"github.com/apoxy-dev/softpsp/vtep"
 	"golang.org/x/sync/errgroup"
 )
 

@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gvisor.dev/gvisor/pkg/tcpip"
 
-	"github.com/apoxy-dev/icx/udp"
+	"github.com/apoxy-dev/softpsp/udp"
 )
 
 func TestEncodeDecode_IPv4(t *testing.T) {

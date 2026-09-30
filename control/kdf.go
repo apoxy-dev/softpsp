@@ -8,7 +8,7 @@
 // handler; this package re-exports them so its API is unchanged.
 package control
 
-import "github.com/apoxy-dev/icx/psp"
+import "github.com/apoxy-dev/softpsp/psp"
 
 // ICXVersion is an AEAD cipher-suite codepoint for an SA. See psp.ICXVersion.
 type ICXVersion = psp.ICXVersion

@@ -23,9 +23,9 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 
-	"github.com/apoxy-dev/icx/filter"
-	"github.com/apoxy-dev/icx/internal/xsk"
-	"github.com/apoxy-dev/icx/queues"
+	"github.com/apoxy-dev/softpsp/filter"
+	"github.com/apoxy-dev/softpsp/internal/xsk"
+	"github.com/apoxy-dev/softpsp/queues"
 )
 
 // Handler decapsulates and encapsulates frames between the physical and virtual

@@ -8,9 +8,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
 
-	"github.com/apoxy-dev/icx/permissions"
-	"github.com/apoxy-dev/icx/queues"
-	"github.com/apoxy-dev/icx/veth"
+	"github.com/apoxy-dev/softpsp/permissions"
+	"github.com/apoxy-dev/softpsp/queues"
+	"github.com/apoxy-dev/softpsp/veth"
 )
 
 func TestVeth(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/apoxy-dev/icx/psp"
+	"github.com/apoxy-dev/softpsp/psp"
 )
 
 // numMasterKeys is the PSP master-key count: one active, one retained for
