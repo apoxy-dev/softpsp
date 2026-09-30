@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: Unit
+    # go build, go vet and the unprivileged tests (race detector on). The
+    # privileged datapath packages run only in the integration lane.
+    runs-on: blacksmith-16vcpu-ubuntu-2204
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.8'
+
+      - uses: ./.github/actions/setup-dagger
+
+      - name: Run build, vet and unit tests via Dagger
+        env:
+          SHUTUP: 1
+        timeout-minutes: 15
+        run: dagger call -v unit --src=.
+
+  integration:
+    name: Integration (${{ matrix.arch }})
+    needs: unit
+    # The full suite, including the AF_XDP/XSK and forwarder tests that need a
+    # real kernel and NET_ADMIN, on amd64 and arm64. The Blacksmith arm64 kernel
+    # has no AF_XDP, so the AF_XDP tests skip there and the arm64 lane covers less.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-16vcpu-ubuntu-2204
+            arch: amd64
+          - runner: blacksmith-16vcpu-ubuntu-2204-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.8'
+
+      - uses: ./.github/actions/setup-dagger
+
+      - name: Run integration tests via Dagger
+        env:
+          SHUTUP: 1
+        timeout-minutes: 20
+        # The Integration function runs `go test -race ./...` with
+        # InsecureRootCapabilities so it can create veth pairs, load the XDP
+        # redirect program and bind AF_XDP sockets on the runner's real kernel.
+        run: dagger call -v integration --src=.

@@ -30,9 +30,9 @@ go vet ./...
 go test ./...
 ```
 
-The forwarder, `internal/xsk` and `veth` tests need root (NET_ADMIN) and a
-kernel with AF_XDP. Without them, the tests skip. CI runs these tests in a
-privileged Dagger lane (see `ci/`).
+The `forwarder`, `internal/xsk` and `veth` tests need root with NET_ADMIN and a
+kernel with AF_XDP. The CI Unit lane leaves them out, and the privileged
+Integration lane runs them (see `ci/`).
 
 ## License
 
