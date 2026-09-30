@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build linux
 
 // Package xsk is an in-repo AF_XDP (XSK) socket implementation, written to

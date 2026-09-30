@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
+
 //go:build linux
 
 // Package afxdp adapts the zero-copy AF_XDP forwarder.Forwarder to the

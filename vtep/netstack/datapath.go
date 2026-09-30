@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
+
 // Package netstack implements the netstack VTEP datapath driver: it splices a
 // gVisor channel.Endpoint (the overlay-side, userspace L3 link) to the ICX
 // engine, moving encap'd frames over an injected underlay transport.

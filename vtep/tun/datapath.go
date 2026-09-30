@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
+
 // Package tun implements the tun VTEP datapath driver: it splices a kernel
 // /dev/net/tun device (the overlay-side, L3 link the consumer routes to) to the
 // ICX engine, moving encap'd frames over a UDP-socket underlay.

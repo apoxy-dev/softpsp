@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package psp implements the PSP-model cryptographic primitives shared by the
 // icx data plane (package icx) and the key-establishment control plane
 // (package control): the NIST SP 800-108 / AES-CMAC key-derivation function

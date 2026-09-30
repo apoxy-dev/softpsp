@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
+
 // Package vtep defines the contract between the engine (encap/decap + crypto)
 // and the I/O driver that moves frames between the engine and the outside
 // world. One engine drives many driver shapes:

@@ -1,0 +1,48 @@
+# softpsp
+
+softpsp is the SoftPSP data path for Apoxy VPC Tunnels v2. It does PSP
+encryption and decryption in user space, and moves overlay packets through a
+TUN (L3) device.
+
+## Status
+
+Early. The code comes from [apoxy-dev/icx](https://github.com/apoxy-dev/icx)
+(with its history). The v2 PSP handler is not written yet. The API can change
+without notice.
+
+## Packages
+
+| Package | Contents |
+| --- | --- |
+| `psp` | PSP key derivation (AES-CMAC KDF) and SPI helpers. |
+| `replay` | Anti-replay window. |
+| `control` | Key-establishment control plane (QUIC/mTLS) and security associations. |
+| `vtep` | Datapath contract and drivers: `tun`, `netstack`, `afxdp`. |
+| `forwarder` | AF_XDP forwarder between a physical NIC and a veth. |
+| `filter` | XDP programs for the forwarder. |
+| `queues`, `udp`, `veth`, `permissions`, `internal/xsk` | Helpers for the packages above. |
+
+## Tests
+
+```sh
+go build ./...
+go vet ./...
+go test ./...
+```
+
+The forwarder, `internal/xsk` and `veth` tests need root (NET_ADMIN) and a
+kernel with AF_XDP. Without them, the tests skip. CI runs these tests in a
+privileged Dagger lane (see `ci/`).
+
+## License
+
+- New code is AGPL-3.0-only. See [LICENSE](LICENSE).
+- Files copied from icx stay under Apache-2.0. See
+  [LICENSE-APACHE](LICENSE-APACHE). These files start with
+  `SPDX-License-Identifier: Apache-2.0`, and the files that Apoxy changed say so.
+- `replay` is from WireGuard and keeps its MIT license header.
+- The eBPF C sources in `filter/ebpf` keep their GPL-2.0 license headers.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // This file implements AES-CMAC (NIST SP 800-38B / RFC 4493), the
 // pseudorandom function underlying the PSP SP 800-108 key-derivation function
 // (see kdf.go). CMAC is built directly on the FIPS-validated crypto/aes block

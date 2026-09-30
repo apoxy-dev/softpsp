@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
+
 // Package control implements ICX's key-establishment control plane (a QUIC/mTLS
 // channel) and the PSP-model key derivation that turns an authenticated,
 // forward-secret session into per-Security-Association AEAD keys for the
