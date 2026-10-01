@@ -10,10 +10,12 @@ package keys
 import (
 	"errors"
 	"time"
+
+	"github.com/apoxy-dev/softpsp/engine"
 )
 
 // MaxLanes is the largest number of SAs that a receiver gives to one sender.
-const MaxLanes = 16
+const MaxLanes = engine.MaxQueues
 
 // ErrBusy is the Rotate error while SAs of the old master key in the other slot
 // are live.

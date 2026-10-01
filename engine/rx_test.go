@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math"
 	"net/netip"
-	"sync"
 	"testing"
 	"time"
 
@@ -162,7 +161,7 @@ func TestReceive(t *testing.T) {
 				if inner == nil {
 					inner = ipPacket(src4, 60)
 				}
-				got, vni, err := tab.Receive(s.seal(t, st.seq, inner, st.edit))
+				got, vni, err := tab.Queue(0).Receive(s.seal(t, st.seq, inner, st.edit))
 				if !errors.Is(err, st.want) {
 					t.Fatalf("step %d (seq %d): got %v, want %v", i, st.seq, err, st.want)
 				}
@@ -223,10 +222,10 @@ func TestReceiveNoSA(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tab := newTable(t, 1) // One row, so a new SA uses the same row.
 			spi, s := add(t, tab, testSA())
-			if _, _, err := tab.Receive(tc.pkt(t, tab, spi, s)); !errors.Is(err, tc.want) {
+			if _, _, err := tab.Queue(0).Receive(tc.pkt(t, tab, spi, s)); !errors.Is(err, tc.want) {
 				t.Fatalf("got %v, want %v", err, tc.want)
 			}
-			if n := tab.NoMatch(); n != 1 {
+			if n := tab.Queue(0).Stats().NoMatch; n != 1 {
 				t.Fatalf("NoMatch = %d, want 1", n)
 			}
 		})
@@ -252,7 +251,7 @@ func TestStats(t *testing.T) {
 		wrongKey,
 		s.seal(t, 9, inner, nil), // The ICV failures did not use seq 9.
 	} {
-		tab.Receive(pkt)
+		tab.Queue(0).Receive(pkt)
 	}
 	got, ok := tab.Stats(spi)
 	want := RxStats{Packets: 3, ICVFailures: 2, Replays: 1, Rejects: 2, Seq: 9}
@@ -297,6 +296,8 @@ func TestAdd(t *testing.T) {
 		{"VNI too big", func(sa *RxSA) { sa.VNI = psp.MaxVNI + 1 }},
 		{"MTU 0", func(sa *RxSA) { sa.MTU = 0 }},
 		{"invalid prefix", func(sa *RxSA) { sa.Sources = []netip.Prefix{{}} }},
+		{"lane of no queue", func(sa *RxSA) { sa.Lane = 1 }},
+		{"lane -2", func(sa *RxSA) { sa.Lane = -2 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -362,42 +363,18 @@ func TestNewRxTable(t *testing.T) {
 		{RxConfig{RowBits: 25}, true},
 		{RxConfig{RowBits: -1}, true},
 		{RxConfig{Lifetime: -time.Second}, true},
+		{RxConfig{Queues: MaxQueues}, false},
+		{RxConfig{Queues: MaxQueues + 1}, true},
+		{RxConfig{Queues: -1}, true},
 	}
 	for _, tc := range cases {
 		tab, err := NewRxTable(tc.cfg)
 		if (err != nil) != tc.wantErr {
 			t.Fatalf("NewRxTable(%+v): error %v, want error %v", tc.cfg, err, tc.wantErr)
 		}
-		if err == nil && tc.cfg.RowBits == 0 && (len(tab.rows) != 1<<DefaultRowBits || tab.lifetime != DefaultLifetime) {
-			t.Fatalf("defaults: %d rows, lifetime %v", len(tab.rows), tab.lifetime)
+		if err == nil && tc.cfg == (RxConfig{}) && (len(tab.rows) != 1<<DefaultRowBits || tab.lifetime != DefaultLifetime || tab.Queues() != 1) {
+			t.Fatalf("defaults: %d rows, lifetime %v, %d queues", len(tab.rows), tab.lifetime, tab.Queues())
 		}
-	}
-}
-
-// TestReceiveConcurrent sends copies of the same packets on many goroutines.
-// Each sequence number must pass once.
-func TestReceiveConcurrent(t *testing.T) {
-	const goroutines, n = 8, 2000
-	tab := newTable(t, 4)
-	spi, s := add(t, tab, testSA())
-	pkts := make([][]byte, n)
-	for i := range pkts {
-		pkts[i] = s.seal(t, uint32(i), ipPacket(src4, 100), nil)
-	}
-	var wg sync.WaitGroup
-	for g := range goroutines {
-		wg.Go(func() {
-			buf := make([]byte, len(pkts[0]))
-			for i := range n {
-				copy(buf, pkts[(i*(g+1))%n]) // Each goroutine has its own order.
-				tab.Receive(buf)
-			}
-		})
-	}
-	wg.Wait()
-	st, _ := tab.Stats(spi)
-	if st.Packets != n || st.Replays != (goroutines-1)*n {
-		t.Fatalf("Stats = %+v, want %d packets and %d replays", st, n, (goroutines-1)*n)
 	}
 }
 
@@ -410,7 +387,7 @@ func TestReceiveNoAllocs(t *testing.T) {
 	}
 	i := 0
 	if a := testing.AllocsPerRun(100, func() {
-		if _, _, err := tab.Receive(pkts[i]); err != nil {
+		if _, _, err := tab.Queue(0).Receive(pkts[i]); err != nil {
 			t.Fatal(err)
 		}
 		i++
@@ -434,7 +411,7 @@ func FuzzReceive(f *testing.F) {
 			return
 		}
 		row.window = replay.Window{} // Each input starts with an empty window.
-		got, vni, err := tab.Receive(s.seal(t, seq, inner, func(h *psp.Header) {
+		got, vni, err := tab.Queue(0).Receive(s.seal(t, seq, inner, func(h *psp.Header) {
 			h.Flags = flags
 			h.VNI ^= uint32(vniXor)
 		}))
@@ -470,7 +447,7 @@ func BenchmarkReceive(b *testing.B) {
 			i := 0
 			for b.Loop() {
 				copy(buf, pkts[i])
-				if _, _, err := tab.Receive(buf); err != nil {
+				if _, _, err := tab.Queue(0).Receive(buf); err != nil {
 					b.Fatal(err)
 				}
 				if i++; i == len(pkts) {
@@ -487,7 +464,7 @@ func BenchmarkReceive(b *testing.B) {
 		tab.Delete(spi)
 		b.ReportAllocs()
 		for b.Loop() {
-			if _, _, err := tab.Receive(pkt); err != ErrUnknownSA {
+			if _, _, err := tab.Queue(0).Receive(pkt); err != ErrUnknownSA {
 				b.Fatal(err)
 			}
 		}

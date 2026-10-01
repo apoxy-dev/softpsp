@@ -102,7 +102,7 @@ func newTestStack(t *testing.T, ep *channel.Endpoint, addr tcpip.Address) *stack
 	}
 	pa := tcpip.ProtocolAddress{
 		Protocol:          ipv4.ProtocolNumber,
-		AddressWithPrefix:  addr.WithPrefix(),
+		AddressWithPrefix: addr.WithPrefix(),
 	}
 	if err := s.AddProtocolAddress(nicID, pa, stack.AddressProperties{}); err != nil {
 		t.Fatalf("AddProtocolAddress: %v", err)

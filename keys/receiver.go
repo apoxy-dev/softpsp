@@ -36,7 +36,9 @@ type PeerConfig struct {
 	VNI     uint32
 	Sources []netip.Prefix // Allowed inner source addresses.
 	MTU     int            // Inner MTU. It sets the packet limit.
-	Lanes   int            // 1 to MaxLanes SAs.
+	// Lanes is the number of SAs, 1 to the queue count of the table. Queue i
+	// owns lane i. With one lane, the queue of the first packet owns the SA.
+	Lanes int
 }
 
 // Peer is one sender of a Receiver.
@@ -97,8 +99,8 @@ func (r *Receiver) Rotate() error {
 
 // NewPeer returns a peer with no SAs.
 func (r *Receiver) NewPeer(cfg PeerConfig) (*Peer, error) {
-	if cfg.Lanes < 1 || cfg.Lanes > MaxLanes {
-		return nil, fmt.Errorf("keys: lanes must be 1 to %d, got %d", MaxLanes, cfg.Lanes)
+	if cfg.Lanes < 1 || cfg.Lanes > r.table.Queues() {
+		return nil, fmt.Errorf("keys: lanes must be 1 to %d, got %d", r.table.Queues(), cfg.Lanes)
 	}
 	cfg.Sources = slices.Clone(cfg.Sources)
 	return &Peer{r: r, cfg: cfg, lanes: make([]*rxSA, cfg.Lanes)}, nil
@@ -218,6 +220,10 @@ func (p *Peer) replace(lanes []int, now time.Time) ([]SA, error) {
 	sas := make([]SA, 0, len(lanes))
 	made := make([]*rxSA, 0, len(lanes))
 	for _, lane := range lanes {
+		owner := lane
+		if len(p.lanes) == 1 {
+			owner = engine.AnyQueue
+		}
 		spi, key, err := r.table.Add(engine.RxSA{
 			Master:      r.masters[r.cur],
 			MasterIndex: r.cur,
@@ -225,6 +231,7 @@ func (p *Peer) replace(lanes []int, now time.Time) ([]SA, error) {
 			VNI:         p.cfg.VNI,
 			Sources:     p.cfg.Sources,
 			MTU:         p.cfg.MTU,
+			Lane:        owner,
 		})
 		if err != nil {
 			for _, sa := range made {

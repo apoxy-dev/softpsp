@@ -28,7 +28,7 @@ var t0 = time.Unix(1_000_000, 0)
 
 func newReceiver(tb testing.TB, rowBits int, v psp.Version) (*Receiver, *engine.RxTable) {
 	tb.Helper()
-	tab, err := engine.NewRxTable(engine.RxConfig{RowBits: rowBits})
+	tab, err := engine.NewRxTable(engine.RxConfig{RowBits: rowBits, Queues: MaxLanes})
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -124,10 +124,10 @@ func sealSeq(tb testing.TB, sa SA, seq uint32) []byte {
 	return pkt
 }
 
-// receive wants tab to accept pkt, or to drop it with want.
-func receive(tb testing.TB, tab *engine.RxTable, pkt []byte, want error) {
+// receive wants the queue of lane to accept pkt, or to drop it with want.
+func receive(tb testing.TB, tab *engine.RxTable, lane int, pkt []byte, want error) {
 	tb.Helper()
-	got, vni, err := tab.Receive(bytes.Clone(pkt))
+	got, vni, err := tab.Queue(lane).Receive(bytes.Clone(pkt))
 	if !errors.Is(err, want) {
 		tb.Fatalf("Receive: got %v, want %v", err, want)
 	}
@@ -158,7 +158,7 @@ func TestOffer(t *testing.T) {
 					t.Fatalf("SA %d: %+v", i, sa)
 				}
 				seen[sa.SPI] = true
-				receive(t, tab, seal(t, tp.SA(i)), nil)
+				receive(t, tab, i, seal(t, tp.SA(i)), nil)
 			}
 			if r.live != [2]int{tc.lanes, 0} {
 				t.Fatalf("live SAs %v", r.live)
@@ -183,14 +183,14 @@ func TestRekeyTime(t *testing.T) {
 	if tp.SA(0).SPI() != ups[0].SAs[0].SPI || tp.SA(1).SPI() != ups[0].SAs[1].SPI {
 		t.Fatal("the sender did not change to the new SAs")
 	}
-	receive(t, tab, seal(t, tp.SA(0)), nil)
-	receive(t, tab, seal(t, tp.SA(1)), nil)
-	receive(t, tab, old1, nil) // The old SA stays for the overlap.
+	receive(t, tab, 0, seal(t, tp.SA(0)), nil)
+	receive(t, tab, 1, seal(t, tp.SA(1)), nil)
+	receive(t, tab, 0, old1, nil) // The old SA stays for the overlap.
 
 	tick(t, r, t0.Add(life-1), 0)
-	receive(t, tab, old2, nil)
+	receive(t, tab, 0, old2, nil)
 	tick(t, r, t0.Add(life), 0)
-	receive(t, tab, old2, engine.ErrUnknownSA)
+	receive(t, tab, 0, old2, engine.ErrUnknownSA)
 	if r.live != [2]int{2, 0} {
 		t.Fatalf("live SAs %v", r.live)
 	}
@@ -203,14 +203,14 @@ func TestRekeyPacketLimit(t *testing.T) {
 	limit := psp.PacketLimit(testMTU)
 	at := limit - limit/4
 
-	receive(t, tab, sealSeq(t, req.SAs[1], at-1), nil)
+	receive(t, tab, 1, sealSeq(t, req.SAs[1], at-1), nil)
 	tick(t, r, t0.Add(time.Second), 0)
-	receive(t, tab, sealSeq(t, req.SAs[1], at), nil)
+	receive(t, tab, 1, sealSeq(t, req.SAs[1], at), nil)
 	ups := tick(t, r, t0.Add(time.Second), 1)
 	if len(ups[0].SAs) != 1 || ups[0].SAs[0].Lane != 1 {
 		t.Fatalf("got %+v, want a rekey of lane 1", ups[0].SAs)
 	}
-	receive(t, tab, sealSeq(t, req.SAs[1], at+1), nil) // The overlap.
+	receive(t, tab, 1, sealSeq(t, req.SAs[1], at+1), nil) // The overlap.
 }
 
 // TestRekeyFull checks that a rekey that does not fit changes nothing, and that
@@ -225,13 +225,13 @@ func TestRekeyFull(t *testing.T) {
 	if ups, err := r.Tick(t0.Add(life * 3 / 4)); !errors.Is(err, engine.ErrFull) || len(ups) != 0 {
 		t.Fatalf("Tick: %d updates, %v, want %v", len(ups), err, engine.ErrFull)
 	}
-	receive(t, tab, pkt, nil)
+	receive(t, tab, 0, pkt, nil)
 	if r.live != [2]int{2, 0} || len(p.old) != 0 {
 		t.Fatalf("live SAs %v, %d old", r.live, len(p.old))
 	}
 	ups := tick(t, r, t0.Add(life), 1) // The SAs expired, so the rows are free.
 	apply(t, tp, ups[0].Request, t0.Add(life))
-	receive(t, tab, seal(t, tp.SA(1)), nil)
+	receive(t, tab, 1, seal(t, tp.SA(1)), nil)
 }
 
 func TestRevoke(t *testing.T) {
@@ -253,15 +253,15 @@ func TestRevoke(t *testing.T) {
 	if tp.SA(0) != nil || tp.SA(1) != nil || len(s.spis) != 0 {
 		t.Fatal("the sender still has SAs")
 	}
-	receive(t, tab, old, engine.ErrUnknownSA)
-	receive(t, tab, cur, engine.ErrUnknownSA)
+	receive(t, tab, 0, old, engine.ErrUnknownSA)
+	receive(t, tab, 1, cur, engine.ErrUnknownSA)
 	if r.live != [2]int{} || len(r.peers) != 0 {
 		t.Fatalf("live SAs %v, %d peers", r.live, len(r.peers))
 	}
 	tick(t, r, t0.Add(life), 0)
 
 	offer(t, p, tp, t0.Add(life))
-	receive(t, tab, seal(t, tp.SA(0)), nil)
+	receive(t, tab, 0, seal(t, tp.SA(0)), nil)
 }
 
 func TestClose(t *testing.T) {
@@ -272,14 +272,14 @@ func TestClose(t *testing.T) {
 	offer(t, p, tp, t0)
 	p.Close()
 	tick(t, r, t0.Add(life*3/4), 0)
-	receive(t, tab, seal(t, tp.SA(0)), nil)
+	receive(t, tab, 0, seal(t, tp.SA(0)), nil)
 	if n := s.Expire(t0.Add(life - 1)); n != 0 {
 		t.Fatalf("Expire removed %d SAs before the lifetime", n)
 	}
 
 	pkt := seal(t, tp.SA(0))
 	tick(t, r, t0.Add(life), 0)
-	receive(t, tab, pkt, engine.ErrUnknownSA)
+	receive(t, tab, 0, pkt, engine.ErrUnknownSA)
 	if r.live != [2]int{} || len(r.peers) != 0 {
 		t.Fatalf("live SAs %v, %d peers", r.live, len(r.peers))
 	}
@@ -305,8 +305,8 @@ func TestRotate(t *testing.T) {
 	if psp.MasterKeyIndex(req.SAs[0].SPI) != 1 || !bytes.Equal(req.SAs[0].Key, key) {
 		t.Fatalf("SA %+v does not use master key 1", req.SAs[0])
 	}
-	receive(t, tab, seal(t, ta.SA(0)), nil) // The old master key's SA stays.
-	receive(t, tab, seal(t, tb.SA(0)), nil)
+	receive(t, tab, 0, seal(t, ta.SA(0)), nil) // The old master key's SA stays.
+	receive(t, tab, 0, seal(t, tb.SA(0)), nil)
 	if err := r.Rotate(); !errors.Is(err, ErrBusy) {
 		t.Fatalf("Rotate with live SAs of master key 0: got %v, want %v", err, ErrBusy)
 	}
@@ -326,7 +326,7 @@ func TestRotate(t *testing.T) {
 	if req := offer(t, pa, ta, t0.Add(life)); psp.MasterKeyIndex(req.SAs[0].SPI) != 0 {
 		t.Fatalf("SA %#x does not use master key 0", req.SAs[0].SPI)
 	}
-	receive(t, tab, seal(t, ta.SA(0)), nil)
+	receive(t, tab, 0, seal(t, ta.SA(0)), nil)
 }
 
 func TestRefused(t *testing.T) {
@@ -353,8 +353,8 @@ func TestRefused(t *testing.T) {
 	if err != nil || again.Op != OpOffer || len(again.SAs) != 1 || again.SAs[0].Lane != 0 || again.SAs[0].SPI == req.SAs[0].SPI {
 		t.Fatalf("Refused: %+v, %v", again, err)
 	}
-	receive(t, tab, pkt, engine.ErrUnknownSA)
-	receive(t, tab, sealSeq(t, again.SAs[0], 1), nil)
+	receive(t, tab, 0, pkt, engine.ErrUnknownSA)
+	receive(t, tab, 0, sealSeq(t, again.SAs[0], 1), nil)
 	if r.live != [2]int{2, 0} {
 		t.Fatalf("live SAs %v", r.live)
 	}
@@ -398,6 +398,10 @@ func TestConfigErrors(t *testing.T) {
 	if _, err := NewReceiver(tab, 2); err == nil {
 		t.Error("NewReceiver accepted version 2")
 	}
+	one, _ := NewReceiver(tab, psp.AESGCM128)
+	if _, err := one.NewPeer(PeerConfig{VNI: 1, MTU: testMTU, Lanes: 2}); err == nil {
+		t.Error("NewPeer accepted 2 lanes on a table with 1 queue")
+	}
 	r, _ := newReceiver(t, 4, psp.AESGCM128)
 	for _, lanes := range []int{0, MaxLanes + 1} {
 		if _, err := r.NewPeer(PeerConfig{VNI: 1, MTU: testMTU, Lanes: lanes}); err == nil {
@@ -433,7 +437,7 @@ func TestConcurrent(t *testing.T) {
 			}
 			n, err := tp.SA(i%2).Seal(pkt, inner)
 			if err == nil {
-				_, _, err = tab.Receive(pkt[:n])
+				_, _, err = tab.Queue(i % 2).Receive(pkt[:n])
 			}
 			if err != nil {
 				t.Error(err)
@@ -466,7 +470,7 @@ func FuzzReceiver(f *testing.F) {
 	f.Fuzz(func(t *testing.T, ops []byte) {
 		r, tab := newReceiver(t, 5, psp.AESGCM128)
 		s := newSender(t)
-		peers := []*Peer{newPeer(t, r, 3), newPeer(t, r, 2)}
+		peers := []*Peer{newPeer(t, r, 3), newPeer(t, r, 1)}
 		tps := []*TxPeer{s.NewPeer(), s.NewPeer()}
 		now := t0
 		send := func(i int, req Request) {
@@ -511,7 +515,7 @@ func FuzzReceiver(f *testing.F) {
 						t.Fatalf("peer %d lane %d: the receiver and the sender do not agree", i, lane)
 					}
 					if tx != nil {
-						receive(t, tab, seal(t, tx), nil)
+						receive(t, tab, lane, seal(t, tx), nil)
 					}
 				}
 				for _, sa := range append(p.old, p.lanes...) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/apoxy-dev/softpsp/psp"
@@ -44,7 +45,7 @@ func TestTxSA(t *testing.T) {
 				if err != nil || h.Seq != seq || h.IV != uint64(seq) || h.Version != v || h.Flags != psp.FlagSeq {
 					t.Fatalf("header %+v, %v: want seq and IV %d, version %d, flag S", h, err, seq, v)
 				}
-				got, vni, err := tab.Receive(pkt[:n])
+				got, vni, err := tab.Queue(0).Receive(pkt[:n])
 				if err != nil || !bytes.Equal(got, inner) || vni != sa.VNI {
 					t.Fatalf("Receive: VNI %#x, %v", vni, err)
 				}
@@ -62,7 +63,7 @@ func TestTxSALimit(t *testing.T) {
 	if _, err := tx.Seal(pkt, inner); err != nil {
 		t.Fatalf("last sequence number: %v", err)
 	}
-	if _, _, err := tab.Receive(pkt); err != nil {
+	if _, _, err := tab.Queue(0).Receive(pkt); err != nil {
 		t.Fatalf("Receive the last sequence number: %v", err)
 	}
 	for range 2 {
@@ -157,5 +158,52 @@ func BenchmarkTxSASeal(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// BenchmarkTxSACounter compares the atomic sequence counter of Seal with a
+// plain counter when one goroutine seals. The parallel cases compare one TxSA
+// for each goroutine, as with lanes, with one TxSA that all goroutines share.
+func BenchmarkTxSACounter(b *testing.B) {
+	for _, n := range []int{64, 1280} {
+		tab := newTable(b, 8)
+		var txs []*TxSA
+		for range 64 {
+			txs = append(txs, addTx(b, tab, testSA()))
+		}
+		tx := txs[0]
+		inner := ipPacket(src4, n)
+		b.Run(fmt.Sprintf("%d/atomic", n), func(b *testing.B) {
+			pkt := make([]byte, len(inner)+psp.Overhead)
+			for b.Loop() {
+				tx.Seal(pkt, inner)
+			}
+		})
+		b.Run(fmt.Sprintf("%d/plain", n), func(b *testing.B) {
+			pkt := make([]byte, len(inner)+psp.Overhead)
+			var next uint64
+			for b.Loop() {
+				seq := next
+				next++
+				h := psp.Header{Version: tx.version, SPI: tx.spi, IV: seq, VNI: tx.vni, Flags: psp.FlagSeq, Seq: uint32(seq)}
+				psp.Seal(tx.aead, h, pkt, inner)
+			}
+		})
+		for _, shared := range []bool{false, true} {
+			name := map[bool]string{false: "parallel own", true: "parallel shared"}[shared]
+			b.Run(fmt.Sprintf("%d/%s", n, name), func(b *testing.B) {
+				var g atomic.Int32
+				b.RunParallel(func(pb *testing.PB) {
+					tx := txs[int(g.Add(1))%len(txs)]
+					if shared {
+						tx = txs[0]
+					}
+					pkt := make([]byte, len(inner)+psp.Overhead)
+					for pb.Next() {
+						tx.Seal(pkt, inner)
+					}
+				})
+			})
+		}
 	}
 }

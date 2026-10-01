@@ -5,6 +5,10 @@
 // The receive side keeps one row for each receive SA. The SPI selects the row
 // directly. After the packet decrypts, the row checks flag S, the VNI, the
 // packet limit, the inner source and the replay window.
+//
+// Each row has one owner queue, and only that queue writes the replay window
+// and the counters of the row. A packet that arrives on another queue goes to
+// the owner queue through a hand-off with a limit for each SA.
 package engine
 
 import (
@@ -26,7 +30,11 @@ import (
 const (
 	DefaultRowBits  = 16
 	DefaultLifetime = 10 * time.Minute
-	maxRowBits      = 24 // Keeps at least 7 random bits in each SPI.
+	MaxQueues       = 16 // The largest number of receive queues.
+	// AnyQueue as RxSA.Lane makes the queue of the first packet that passes
+	// all checks the owner of the SA.
+	AnyQueue   = -1
+	maxRowBits = 24 // Keeps at least 7 random bits in each SPI.
 )
 
 var (
@@ -37,6 +45,11 @@ var (
 	ErrSource    = errors.New("engine: inner source is not allowed for the SA")
 	ErrReplay    = errors.New("engine: sequence number is a replay or too old")
 	ErrFull      = errors.New("engine: no free receive row")
+	// ErrHandoff tells that the packet went to the owner queue of its SA.
+	ErrHandoff = errors.New("engine: packet went to the owner queue of the SA")
+	// ErrHandoffDrop tells that the packet dropped: too many packets wait for
+	// the owner queue, or another queue became the owner of the SA first.
+	ErrHandoffDrop = errors.New("engine: packet dropped at the hand-off to the owner queue")
 )
 
 // RxConfig configures an RxTable.
@@ -47,6 +60,8 @@ type RxConfig struct {
 	RowBits int
 	// Lifetime is how long an SA stays after Add. Expire removes it after that.
 	Lifetime time.Duration
+	// Queues is the number of receive queues, 1 to MaxQueues. Default 1.
+	Queues int
 }
 
 // RxSA is a receive SA for Add.
@@ -57,6 +72,7 @@ type RxSA struct {
 	VNI         uint32
 	Sources     []netip.Prefix // Allowed inner source addresses.
 	MTU         int            // Inner MTU. It sets the packet limit.
+	Lane        int            // Owner queue, or AnyQueue.
 }
 
 // RxStats are the counters of one receive SA.
@@ -68,13 +84,13 @@ type RxStats struct {
 	Seq         uint32 // Highest accepted sequence number, or 0.
 }
 
-// RxTable holds the receive rows. Receive can run on many goroutines at once.
+// RxTable holds the receive rows and the receive queues.
 type RxTable struct {
 	rows     []atomic.Pointer[rxRow]
 	rowBits  uint
 	rowMask  uint32
 	lifetime time.Duration
-	nomatch  atomic.Uint64
+	queues   []*RxQueue
 
 	mu    sync.Mutex // Serializes Add, Delete and Expire.
 	next  []uint32   // For each row, the random SPI bits of the next Add.
@@ -89,14 +105,21 @@ type rxRow struct {
 	version psp.Version
 	vni     uint32
 	limit   uint32
+	maxLen  int   // Longest PSP packet that a hand-off copies.
 	expires int64 // Unix nanoseconds.
 	aead    cipher.AEAD
 	sources []netip.Prefix
+	owner   atomic.Int32 // Owner queue. AnyQueue until the first packet passes.
 
+	// Only the owner queue writes these, except that ICV failures and rejects
+	// can come from any queue while the owner is AnyQueue.
+	window                                 replay.Window
+	seq                                    atomic.Uint32 // window.Last() for Stats.
 	packets, icvFailures, replays, rejects atomic.Uint64
 
-	mu     sync.Mutex // Guards window: more than one queue can receive for an SA.
-	window replay.Window
+	// The inbox lock of the owner queue guards these.
+	handoffGen uint64
+	handoffs   int
 }
 
 // NewRxTable returns an empty receive table.
@@ -107,11 +130,17 @@ func NewRxTable(cfg RxConfig) (*RxTable, error) {
 	if cfg.Lifetime == 0 {
 		cfg.Lifetime = DefaultLifetime
 	}
+	if cfg.Queues == 0 {
+		cfg.Queues = 1
+	}
 	if cfg.RowBits < 1 || cfg.RowBits > maxRowBits {
 		return nil, fmt.Errorf("engine: RowBits must be 1 to %d, got %d", maxRowBits, cfg.RowBits)
 	}
 	if cfg.Lifetime < 0 {
 		return nil, fmt.Errorf("engine: Lifetime must be positive, got %v", cfg.Lifetime)
+	}
+	if cfg.Queues < 1 || cfg.Queues > MaxQueues {
+		return nil, fmt.Errorf("engine: Queues must be 1 to %d, got %d", MaxQueues, cfg.Queues)
 	}
 	n := 1 << cfg.RowBits
 	t := &RxTable{
@@ -122,6 +151,9 @@ func NewRxTable(cfg RxConfig) (*RxTable, error) {
 		next:     make([]uint32, n),
 		left:     make([]uint32, n),
 		free:     make([]uint32, n),
+	}
+	for i := range cfg.Queues {
+		t.queues = append(t.queues, newRxQueue(t, i))
 	}
 	seed := make([]byte, 4*n)
 	if _, err := rand.Read(seed); err != nil {
@@ -149,6 +181,8 @@ func (t *RxTable) Add(sa RxSA) (uint32, []byte, error) {
 		return 0, nil, psp.ErrVNI
 	case sa.MTU <= 0:
 		return 0, nil, fmt.Errorf("engine: MTU must be positive, got %d", sa.MTU)
+	case sa.Lane != AnyQueue && (sa.Lane < 0 || sa.Lane >= len(t.queues)):
+		return 0, nil, fmt.Errorf("engine: lane must be AnyQueue or 0 to %d, got %d", len(t.queues)-1, sa.Lane)
 	}
 	for _, p := range sa.Sources {
 		if !p.IsValid() {
@@ -179,15 +213,18 @@ func (t *RxTable) Add(sa RxSA) (uint32, []byte, error) {
 		t.release(r)
 		return 0, nil, err
 	}
-	t.rows[r].Store(&rxRow{
+	row := &rxRow{
 		spi:     spi,
 		version: sa.Version,
 		vni:     sa.VNI,
 		limit:   psp.PacketLimit(sa.MTU),
+		maxLen:  sa.MTU + psp.Overhead,
 		expires: time.Now().Add(t.lifetime).UnixNano(),
 		aead:    aead,
 		sources: slices.Clone(sa.Sources),
-	})
+	}
+	row.owner.Store(int32(sa.Lane))
+	t.rows[r].Store(row)
 	return spi, key, nil
 }
 
@@ -225,60 +262,23 @@ func (t *RxTable) Stats(spi uint32) (RxStats, bool) {
 	if row == nil || row.spi != spi {
 		return RxStats{}, false
 	}
-	row.mu.Lock()
-	seq := row.window.Last()
-	row.mu.Unlock()
 	return RxStats{
 		Packets:     row.packets.Load(),
 		ICVFailures: row.icvFailures.Load(),
 		Replays:     row.replays.Load(),
 		Rejects:     row.rejects.Load(),
-		Seq:         seq,
+		Seq:         row.seq.Load(),
 	}, true
 }
 
 // Lifetime returns how long an SA stays after Add.
 func (t *RxTable) Lifetime() time.Duration { return t.lifetime }
 
-// NoMatch returns how many packets had a bad header or no SA.
-func (t *RxTable) NoMatch() uint64 { return t.nomatch.Load() }
+// Queues returns the number of receive queues.
+func (t *RxTable) Queues() int { return len(t.queues) }
 
-// Receive checks and decrypts the PSP packet pkt in place. It returns the
-// inner packet, which is in pkt, and the VNI.
-func (t *RxTable) Receive(pkt []byte) ([]byte, uint32, error) {
-	h, err := psp.ParseHeader(pkt)
-	if err != nil {
-		t.nomatch.Add(1)
-		return nil, 0, err
-	}
-	row := t.rows[h.SPI&t.rowMask].Load()
-	if row == nil || row.spi != h.SPI || row.version != h.Version {
-		t.nomatch.Add(1)
-		return nil, 0, ErrUnknownSA
-	}
-	inner, err := psp.OpenInPlace(row.aead, pkt)
-	if errors.Is(err, psp.ErrAuth) {
-		row.icvFailures.Add(1)
-		return nil, 0, err
-	}
-	if err == nil {
-		err = row.check(&h, inner)
-	}
-	if err != nil {
-		row.rejects.Add(1)
-		return nil, 0, err
-	}
-
-	row.mu.Lock()
-	fresh := row.window.Check(h.Seq)
-	row.mu.Unlock()
-	if !fresh {
-		row.replays.Add(1)
-		return nil, 0, ErrReplay
-	}
-	row.packets.Add(1)
-	return inner, h.VNI, nil
-}
+// Queue returns receive queue i.
+func (t *RxTable) Queue(i int) *RxQueue { return t.queues[i] }
 
 // check runs the checks that do not change the row state.
 func (row *rxRow) check(h *psp.Header, inner []byte) error {
