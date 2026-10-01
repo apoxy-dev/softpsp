@@ -203,6 +203,26 @@ func TestOpenErrors(t *testing.T) {
 	}
 }
 
+func TestPacketLimit(t *testing.T) {
+	cases := []struct {
+		mtu  int
+		want uint32
+	}{
+		{0, 1 << 31},
+		{1280, 1 << 31},
+		{1500, 1 << 31},
+		{2048, 1 << 31}, // 128 blocks: 2^38 / 2^7 = 2^31.
+		{2049, (1 << 38) / 129},
+		{9000, (1 << 38) / 563},
+		{65535, (1 << 38) / 4096},
+	}
+	for _, tc := range cases {
+		if got := PacketLimit(tc.mtu); got != tc.want {
+			t.Errorf("PacketLimit(%d) = %d, want %d", tc.mtu, got, tc.want)
+		}
+	}
+}
+
 func TestNewAEAD(t *testing.T) {
 	for _, n := range []int{0, 15, 24, 33} {
 		if _, err := NewAEAD(make([]byte, n)); err == nil {

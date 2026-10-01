@@ -24,6 +24,13 @@ func NewAEAD(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
+// PacketLimit returns how many packets one SA can carry with an inner MTU:
+// min(2^31, 2^38 / ceil(MTU / 16)). Sequence numbers 0 to limit-1 are valid.
+func PacketLimit(mtu int) uint32 {
+	blocks := uint64(max(mtu+15, 16) / 16)
+	return uint32(min(1<<31, (1<<38)/blocks))
+}
+
 // Seal writes the PSP packet for the inner IP packet to dst and returns its
 // length, len(inner)+Overhead. dst must not overlap inner. Seal sets NextHdr
 // from the inner packet and ignores h.NextHdr.

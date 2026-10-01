@@ -16,7 +16,8 @@ without notice.
 | --- | --- |
 | `psp` | PSP tunnel-mode packet codec, key derivation (AES-CMAC KDF) and SPI helpers. |
 | `interop` | Checks of `psp` against the [google/psp](https://github.com/google/psp) reference code. |
-| `replay` | Anti-replay window. |
+| `engine` | Packet engine. Receive SA rows: SPI lookup, decryption, VNI, source, packet limit and replay checks. |
+| `replay` | RFC 6479 anti-replay window on the 32-bit sequence number. |
 | `control` | Key-establishment control plane (QUIC/mTLS) and security associations. |
 | `vtep` | Datapath contract and drivers: `tun`, `netstack`, `afxdp`. |
 | `forwarder` | AF_XDP forwarder between a physical NIC and a veth. |

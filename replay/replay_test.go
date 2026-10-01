@@ -3,110 +3,137 @@
  * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
  */
 
+// Apoxy changed this file for softpsp.
+
 package replay
 
 import (
+	"encoding/binary"
+	"math"
 	"testing"
+	"unsafe"
 )
 
-func TestReplay(t *testing.T) {
-	var filter Filter
+type step struct {
+	seq  uint32
+	want bool
+}
 
-	const T_LIM = windowSize + 1
-
-	testNumber := 0
-	T := func(n uint64, expected bool) {
-		testNumber++
-		if filter.ValidateCounter(n, RejectAfterMessages) != expected {
-			t.Fatal("Test", testNumber, "failed", n, expected)
+// run returns the steps for seq = from, from+inc, ... to (inclusive).
+func run(from, to uint32, inc int, want bool) []step {
+	var s []step
+	for i := int64(from); ; i += int64(inc) {
+		s = append(s, step{uint32(i), want})
+		if i == int64(to) {
+			return s
 		}
 	}
+}
 
-	filter.Reset()
-
-	T(0, true)                      /*  1 */
-	T(1, true)                      /*  2 */
-	T(1, false)                     /*  3 */
-	T(9, true)                      /*  4 */
-	T(8, true)                      /*  5 */
-	T(7, true)                      /*  6 */
-	T(7, false)                     /*  7 */
-	T(T_LIM, true)                  /*  8 */
-	T(T_LIM-1, true)                /*  9 */
-	T(T_LIM-1, false)               /* 10 */
-	T(T_LIM-2, true)                /* 11 */
-	T(2, true)                      /* 12 */
-	T(2, false)                     /* 13 */
-	T(T_LIM+16, true)               /* 14 */
-	T(3, false)                     /* 15 */
-	T(T_LIM+16, false)              /* 16 */
-	T(T_LIM*4, true)                /* 17 */
-	T(T_LIM*4-(T_LIM-1), true)      /* 18 */
-	T(10, false)                    /* 19 */
-	T(T_LIM*4-T_LIM, false)         /* 20 */
-	T(T_LIM*4-(T_LIM+1), false)     /* 21 */
-	T(T_LIM*4-(T_LIM-2), true)      /* 22 */
-	T(T_LIM*4+1-T_LIM, false)       /* 23 */
-	T(0, false)                     /* 24 */
-	T(RejectAfterMessages, false)   /* 25 */
-	T(RejectAfterMessages-1, true)  /* 26 */
-	T(RejectAfterMessages, false)   /* 27 */
-	T(RejectAfterMessages-1, false) /* 28 */
-	T(RejectAfterMessages-2, true)  /* 29 */
-	T(RejectAfterMessages+1, false) /* 30 */
-	T(RejectAfterMessages+2, false) /* 31 */
-	T(RejectAfterMessages-2, false) /* 32 */
-	T(RejectAfterMessages-3, true)  /* 33 */
-	T(0, false)                     /* 34 */
-
-	t.Log("Bulk test 1")
-	filter.Reset()
-	testNumber = 0
-	for i := uint64(1); i <= windowSize; i++ {
-		T(i, true)
+func join(parts ...[]step) []step {
+	var s []step
+	for _, p := range parts {
+		s = append(s, p...)
 	}
-	T(0, true)
-	T(0, false)
+	return s
+}
 
-	t.Log("Bulk test 2")
-	filter.Reset()
-	testNumber = 0
-	for i := uint64(2); i <= windowSize+1; i++ {
-		T(i, true)
+func TestWindow(t *testing.T) {
+	const lim = WindowSize + 1
+	const top = math.MaxUint32
+	cases := []struct {
+		name  string
+		steps []step
+	}{
+		{"wireguard", []step{
+			{0, true}, {1, true}, {1, false}, {9, true}, {8, true}, {7, true}, {7, false},
+			{lim, true}, {lim - 1, true}, {lim - 1, false}, {lim - 2, true}, {2, true}, {2, false},
+			{lim + 16, true}, {3, false}, {lim + 16, false}, {lim * 4, true}, {lim*4 - (lim - 1), true},
+			{10, false}, {lim*4 - lim, false}, {lim*4 - (lim + 1), false}, {lim*4 - (lim - 2), true},
+			{lim*4 + 1 - lim, false}, {0, false},
+		}},
+		{"in order then 0", join(run(1, WindowSize, 1, true), []step{{0, true}, {0, false}})},
+		{"in order from 2 then 1", join(run(2, WindowSize+1, 1, true), []step{{1, true}, {0, false}})},
+		{"reverse", run(WindowSize+1, 1, -1, true)},
+		{"reverse from 2", join(run(WindowSize+2, 2, -1, true), []step{{0, false}})},
+		{"reverse then ahead", join(run(WindowSize, 1, -1, true), []step{{WindowSize + 1, true}, {0, false}})},
+		{"reverse then 0", join(run(WindowSize, 1, -1, true), []step{{0, true}, {WindowSize + 1, true}})},
+		{"duplicates", []step{{5, true}, {5, false}, {6, true}, {5, false}, {6, false}, {4, true}}},
+		{"window edge", []step{{lim + 9, true}, {9, false}, {10, true}, {10, false}}},
+		{"top of range", []step{
+			{top - 1, true}, {top, true}, {top, false}, {top - 1, false},
+			{top - WindowSize, true}, {top - WindowSize - 1, false}, {0, false},
+		}},
 	}
-	T(1, true)
-	T(0, false)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var w Window
+			for i, s := range tc.steps {
+				if got := w.Check(s.seq); got != s.want {
+					t.Fatalf("step %d: Check(%d) = %v, want %v", i, s.seq, got, s.want)
+				}
+			}
+		})
+	}
+}
 
-	t.Log("Bulk test 3")
-	filter.Reset()
-	testNumber = 0
-	for i := uint64(windowSize + 1); i > 0; i-- {
-		T(i, true)
+func TestWindowSize(t *testing.T) {
+	if n := unsafe.Sizeof(Window{}); n > 520 {
+		t.Fatalf("Window is %d bytes, want at most 520", n)
 	}
+}
 
-	t.Log("Bulk test 4")
-	filter.Reset()
-	testNumber = 0
-	for i := uint64(windowSize + 2); i > 1; i-- {
-		T(i, true)
-	}
-	T(0, false)
+// FuzzWindow compares Window with a simple model: a sequence number is new if
+// it was not seen and it is at most WindowSize below the highest one seen.
+func FuzzWindow(f *testing.F) {
+	f.Add([]byte{0, 1, 0, 1, 0x80, 0, 0, 2, 0xff, 0xff})
+	f.Add([]byte{0x7f, 0xff, 0x80, 0x00, 0x00, 0x01, 0x00, 0x01})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var w Window
+		seen := map[uint32]bool{}
+		var last uint32
+		for i := 0; i+1 < len(data); i += 2 {
+			// Each step moves around the window edge: a signed delta from the
+			// highest sequence number, times 8 when the low bit is set.
+			d := int64(int16(binary.BigEndian.Uint16(data[i:])))
+			if d&1 != 0 {
+				d *= 8
+			}
+			s := int64(last) + d
+			if s < 0 || s > math.MaxUint32 {
+				continue
+			}
+			seq := uint32(s)
+			want := !seen[seq] && (seq > last || last-seq <= WindowSize)
+			if got := w.Check(seq); got != want {
+				t.Fatalf("Check(%d) after last %d = %v, want %v", seq, last, got, want)
+			}
+			if want {
+				seen[seq] = true
+				last = max(last, seq)
+			}
+		}
+	})
+}
 
-	t.Log("Bulk test 5")
-	filter.Reset()
-	testNumber = 0
-	for i := uint64(windowSize); i > 0; i-- {
-		T(i, true)
+func BenchmarkWindow(b *testing.B) {
+	cases := []struct {
+		name string
+		next func(i uint32) uint32
+	}{
+		{"in order", func(i uint32) uint32 { return i }},
+		{"reorder", func(i uint32) uint32 { return i ^ 7 }}, // Blocks of 8 in reverse order.
+		{"replay", func(i uint32) uint32 { return 1000 }},
 	}
-	T(windowSize+1, true)
-	T(0, false)
-
-	t.Log("Bulk test 6")
-	filter.Reset()
-	testNumber = 0
-	for i := uint64(windowSize); i > 0; i-- {
-		T(i, true)
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			var w Window
+			var i uint32
+			b.ReportAllocs()
+			for b.Loop() {
+				w.Check(tc.next(i))
+				i++
+			}
+		})
 	}
-	T(0, true)
-	T(windowSize+1, true)
 }
