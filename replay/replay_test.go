@@ -68,9 +68,16 @@ func TestWindow(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var w Window
+			var last uint32
 			for i, s := range tc.steps {
 				if got := w.Check(s.seq); got != s.want {
 					t.Fatalf("step %d: Check(%d) = %v, want %v", i, s.seq, got, s.want)
+				}
+				if s.want {
+					last = max(last, s.seq)
+				}
+				if w.Last() != last {
+					t.Fatalf("step %d: Last() = %d, want %d", i, w.Last(), last)
 				}
 			}
 		})

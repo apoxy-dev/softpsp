@@ -51,3 +51,6 @@ func (w *Window) Check(seq uint32) bool {
 	w.ring[idx] = old | bit
 	return old&bit == 0
 }
+
+// Last returns the highest sequence number that Check accepted, or 0.
+func (w *Window) Last() uint32 { return w.last }

@@ -5,7 +5,6 @@ go 1.26.8
 require (
 	github.com/cilium/ebpf v0.18.0
 	github.com/google/gopacket v1.1.19
-	github.com/quic-go/quic-go v0.59.1
 	github.com/safchain/ethtool v0.6.1
 	github.com/stretchr/testify v1.11.1
 	github.com/vishvananda/netlink v1.3.1

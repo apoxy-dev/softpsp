@@ -65,6 +65,7 @@ type RxStats struct {
 	ICVFailures uint64 // Packets that did not authenticate.
 	Replays     uint64 // Authenticated packets that the replay window dropped.
 	Rejects     uint64 // Other authenticated packets that a check dropped.
+	Seq         uint32 // Highest accepted sequence number, or 0.
 }
 
 // RxTable holds the receive rows. Receive can run on many goroutines at once.
@@ -224,13 +225,20 @@ func (t *RxTable) Stats(spi uint32) (RxStats, bool) {
 	if row == nil || row.spi != spi {
 		return RxStats{}, false
 	}
+	row.mu.Lock()
+	seq := row.window.Last()
+	row.mu.Unlock()
 	return RxStats{
 		Packets:     row.packets.Load(),
 		ICVFailures: row.icvFailures.Load(),
 		Replays:     row.replays.Load(),
 		Rejects:     row.rejects.Load(),
+		Seq:         seq,
 	}, true
 }
+
+// Lifetime returns how long an SA stays after Add.
+func (t *RxTable) Lifetime() time.Duration { return t.lifetime }
 
 // NoMatch returns how many packets had a bad header or no SA.
 func (t *RxTable) NoMatch() uint64 { return t.nomatch.Load() }

@@ -255,7 +255,7 @@ func TestStats(t *testing.T) {
 		tab.Receive(pkt)
 	}
 	got, ok := tab.Stats(spi)
-	want := RxStats{Packets: 3, ICVFailures: 2, Replays: 1, Rejects: 2}
+	want := RxStats{Packets: 3, ICVFailures: 2, Replays: 1, Rejects: 2, Seq: 9}
 	if !ok || got != want {
 		t.Fatalf("Stats = %+v, %v, want %+v", got, ok, want)
 	}

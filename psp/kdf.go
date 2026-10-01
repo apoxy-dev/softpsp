@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Apoxy changed this file for softpsp.
 
-// Package psp implements the PSP-model cryptographic primitives shared by the
-// data plane and the key-establishment control plane
-// (package control): the NIST SP 800-108 / AES-CMAC key-derivation function
-// from the PSP Architecture Specification, the SPI bit layout that
-// partitions the derivation space by master key and allocating role, and the
-// tunnel-mode packet codec (header.go, aead.go).
-//
-// The package is a stdlib-only leaf so the data-plane handler can derive its
-// own security-association keys without importing the control plane (and its
-// QUIC/x509 dependency tree).
+// Package psp implements the PSP primitives of the data plane: the NIST
+// SP 800-108 / AES-CMAC key-derivation function from the PSP Architecture
+// Specification, the SPI master key index, and the tunnel-mode packet codec
+// (header.go, aead.go). It uses only the standard library.
 package psp
 
 import (
@@ -20,8 +14,7 @@ import (
 
 // Version is an AEAD cipher-suite codepoint for an SA. It selects both the
 // AEAD (AES-GCM-128 vs AES-GCM-256) and, via the KDF label, the size of the
-// derived security-association key. It is a local cipher selector, not a
-// wire-format version (that is ProtocolVersion in the control plane).
+// derived security-association key. The PSP header carries it.
 type Version uint8
 
 const (

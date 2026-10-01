@@ -14,11 +14,11 @@ without notice.
 
 | Package | Contents |
 | --- | --- |
-| `psp` | PSP tunnel-mode packet codec, key derivation (AES-CMAC KDF) and SPI helpers. |
+| `psp` | PSP tunnel-mode packet codec, key derivation (AES-CMAC KDF) and the SPI master key index. |
 | `interop` | Checks of `psp` against the [google/psp](https://github.com/google/psp) reference code. |
-| `engine` | Packet engine. Receive SA rows: SPI lookup, decryption, VNI, source, packet limit and replay checks. |
+| `engine` | Packet engine. Receive SA rows: SPI lookup, decryption, VNI, source, packet limit and replay checks. Transmit SAs. |
+| `keys` | Receiver-created SAs: two master keys, offers, rekeys, revokes, and the transmit SAs of a sender. |
 | `replay` | RFC 6479 anti-replay window on the 32-bit sequence number. |
-| `control` | Key-establishment control plane (QUIC/mTLS) and security associations. |
 | `vtep` | Datapath contract and drivers: `tun`, `netstack`, `afxdp`. |
 | `forwarder` | AF_XDP forwarder between a physical NIC and a veth. |
 | `filter` | XDP programs for the forwarder. |
