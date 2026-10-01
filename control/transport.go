@@ -246,7 +246,7 @@ type DirectionalSAs struct {
 	Master  [MasterKeyLen]byte
 	RxSPI   uint32
 	TxSPI   uint32
-	Version ICXVersion
+	Version Version
 }
 
 // NegotiateSAs runs the SA-setup exchange over a fresh QUIC stream and returns
@@ -266,7 +266,7 @@ type DirectionalSAs struct {
 // sequentially, or have both peers issue the same number of concurrent calls
 // (≤ MaxIncomingStreams); a surplus initiator call blocks until a matching
 // responder call or the ctx deadline.
-func (s *Session) NegotiateSAs(ctx context.Context, v ICXVersion) (*DirectionalSAs, error) {
+func (s *Session) NegotiateSAs(ctx context.Context, v Version) (*DirectionalSAs, error) {
 	if !v.Valid() {
 		return nil, fmt.Errorf("control: unsupported cipher suite %d", v)
 	}
@@ -315,7 +315,7 @@ func (s *Session) NegotiateSAs(ctx context.Context, v ICXVersion) (*DirectionalS
 // keys (distinct role bits => distinct SPIs => distinct KDF contexts), and the
 // handler re-checks rxSPI != txSPI at install, so no key-equality assertion is
 // needed here.
-func (s *Session) deriveDirectional(v ICXVersion, myRxSPI uint32, peer saOffer) (*DirectionalSAs, error) {
+func (s *Session) deriveDirectional(v Version, myRxSPI uint32, peer saOffer) (*DirectionalSAs, error) {
 	if peer.Version != v {
 		return nil, fmt.Errorf("control: cipher suite mismatch: local %d, peer %d", v, peer.Version)
 	}

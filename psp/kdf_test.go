@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 package psp
 
@@ -62,7 +63,7 @@ func TestDeriveSAKey_PSPSpec(t *testing.T) {
 		name    string
 		master  []byte
 		spi     uint32
-		version ICXVersion
+		version Version
 		want    string
 	}{
 		{
@@ -103,7 +104,7 @@ func TestDeriveSAKey_BadMasterKeyLen(t *testing.T) {
 
 func TestDeriveSAKey_UnsupportedVersionFailsClosed(t *testing.T) {
 	mk := make([]byte, MasterKeyLen)
-	if _, err := DeriveSAKey(mk, 1, ICXVersion(7)); err == nil {
+	if _, err := DeriveSAKey(mk, 1, Version(7)); err == nil {
 		t.Fatal("expected error for unsupported cipher suite, got nil (must fail closed, not default to 16 bytes)")
 	}
 }

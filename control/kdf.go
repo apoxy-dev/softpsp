@@ -13,8 +13,8 @@ package control
 
 import "github.com/apoxy-dev/softpsp/psp"
 
-// ICXVersion is an AEAD cipher-suite codepoint for an SA. See psp.ICXVersion.
-type ICXVersion = psp.ICXVersion
+// Version is an AEAD cipher-suite codepoint for an SA. See psp.Version.
+type Version = psp.Version
 
 const (
 	// AESGCM128 selects AES-GCM-128: a 16-byte SA key. The default.
@@ -28,6 +28,6 @@ const MasterKeyLen = psp.MasterKeyLen
 
 // DeriveSAKey derives a PSP security-association key from a 256-bit master key
 // and a 32-bit SPI per the PSP Architecture Specification. See psp.DeriveSAKey.
-func DeriveSAKey(masterKey []byte, spi uint32, v ICXVersion) ([]byte, error) {
+func DeriveSAKey(masterKey []byte, spi uint32, v Version) ([]byte, error) {
 	return psp.DeriveSAKey(masterKey, spi, v)
 }

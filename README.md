@@ -14,7 +14,8 @@ without notice.
 
 | Package | Contents |
 | --- | --- |
-| `psp` | PSP key derivation (AES-CMAC KDF) and SPI helpers. |
+| `psp` | PSP tunnel-mode packet codec, key derivation (AES-CMAC KDF) and SPI helpers. |
+| `interop` | Checks of `psp` against the [google/psp](https://github.com/google/psp) reference code. |
 | `replay` | Anti-replay window. |
 | `control` | Key-establishment control plane (QUIC/mTLS) and security associations. |
 | `vtep` | Datapath contract and drivers: `tun`, `netstack`, `afxdp`. |
@@ -33,6 +34,11 @@ go test ./...
 The `forwarder`, `internal/xsk` and `veth` tests need root with NET_ADMIN and a
 kernel with AF_XDP. The CI Unit lane leaves them out, and the privileged
 Integration lane runs them (see `ci/`).
+
+The CI Interop lane (`dagger call interop --src=.`) builds the google/psp
+reference code and checks the codec against it in both directions.
+`interop/testdata/vectors.json` keeps the reference output, so `go test` checks
+it without the C code.
 
 ## License
 

@@ -74,7 +74,7 @@ var ErrGrantRejected = errors.New("control: key request rejected by responder")
 // on and the overlay address it wants keyed. The address is opaque to the
 // control plane — the responder's KeyGranter gives it meaning.
 type keyRequest struct {
-	Version ICXVersion
+	Version Version
 	RxSPI   uint32
 	Addr    netip.Addr
 }
@@ -103,7 +103,7 @@ func parseKeyRequest(b []byte) (keyRequest, error) {
 		return keyRequest{}, fmt.Errorf("control: expected key request, got message type %d", b[1])
 	}
 	return keyRequest{
-		Version: ICXVersion(b[2]),
+		Version: Version(b[2]),
 		RxSPI:   binary.BigEndian.Uint32(b[3:7]),
 		// Unmap so a native IPv4 overlay address round-trips to itself rather
 		// than to its ::ffff: 4-in-6 form, which compares unequal and would make
@@ -116,7 +116,7 @@ func parseKeyRequest(b []byte) (keyRequest, error) {
 // non-OK status with both fields zero.
 type keyGrant struct {
 	Status  grantStatus
-	Version ICXVersion
+	Version Version
 	RxSPI   uint32
 	VNI     uint32
 }
@@ -146,7 +146,7 @@ func parseKeyGrant(b []byte) (keyGrant, error) {
 	}
 	return keyGrant{
 		Status:  grantStatus(b[2]),
-		Version: ICXVersion(b[3]),
+		Version: Version(b[3]),
 		RxSPI:   binary.BigEndian.Uint32(b[4:8]),
 		VNI:     binary.BigEndian.Uint32(b[8:12]),
 	}, nil
@@ -219,7 +219,7 @@ type KeyGrant struct {
 // one session are safe and every grant has distinct keys. On
 // ErrVNIExhausted/ErrSPIExhausted the session is useless for new grants;
 // existing grants keep working until released or rotated.
-func (s *Session) RequestKeys(ctx context.Context, v ICXVersion, addr netip.Addr) (*KeyGrant, error) {
+func (s *Session) RequestKeys(ctx context.Context, v Version, addr netip.Addr) (*KeyGrant, error) {
 	if s.role != Initiator {
 		return nil, errors.New("control: RequestKeys requires the initiator role")
 	}

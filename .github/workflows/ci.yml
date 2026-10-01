@@ -28,6 +28,28 @@ jobs:
         timeout-minutes: 15
         run: dagger call -v unit --src=.
 
+  interop:
+    name: Interop (google/psp)
+    # Builds the google/psp reference code and checks the PSP codec and KDF
+    # against it in both directions, and the vectors in interop/testdata.
+    runs-on: blacksmith-16vcpu-ubuntu-2204
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.8'
+
+      - uses: ./.github/actions/setup-dagger
+
+      - name: Run interop tests via Dagger
+        env:
+          SHUTUP: 1
+        timeout-minutes: 15
+        run: dagger call -v interop --src=.
+
   integration:
     name: Integration (${{ matrix.arch }})
     needs: unit

@@ -65,11 +65,11 @@ func ReservedSPI(spi uint32) bool { return psp.ReservedSPI(spi) }
 type SA struct {
 	SPI     uint32
 	Key     []byte
-	Version ICXVersion
+	Version Version
 }
 
 // DeriveSA derives the SA key for spi using the master key its MSB selects.
-func (m *MasterKeys) DeriveSA(spi uint32, v ICXVersion) (*SA, error) {
+func (m *MasterKeys) DeriveSA(spi uint32, v Version) (*SA, error) {
 	if psp.ReservedSPI(spi) {
 		return nil, errors.New("control: SPI low 31 bits must be non-zero (zero is reserved)")
 	}

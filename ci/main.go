@@ -3,13 +3,14 @@
 
 // Package main is the softpsp Dagger CI/test harness.
 //
-// It has two lanes, which run locally (`dagger call <fn>`) and in GitHub
+// It has three lanes, which run locally (`dagger call <fn>`) and in GitHub
 // Actions:
 //
 //   - Unit: go build and go vet over the module, then the tests minus the
 //     root-requiring datapath packages, unprivileged, race detector on.
 //   - Integration: the whole tree WITH the root capability set, on a real
 //     kernel, so the veth/AF_XDP/forwarder tests actually run.
+//   - Interop: the interop tests against the google/psp reference code.
 //
 // Every command is run as a real argv — no `sh -c` — so there is no
 // shell-quoting surface; the package filtering for Unit is done in Go against
@@ -28,6 +29,13 @@ import (
 
 const goImage = "golang:1.26.8-bookworm"
 
+// The google/psp commit that the Interop lane builds. interop/testdata has
+// its output, so a change here needs new vectors (see the interop package).
+const (
+	pspRefRepo   = "https://github.com/google/psp"
+	pspRefCommit = "8ac5fc19be57fbff18f44bb0b1d8e91c34b7260a"
+)
+
 // privilegedPkgRe matches the packages whose tests need the root capability
 // set: they create veth pairs / AF_XDP sockets. Unit filters them out of
 // `go list`; Integration runs the whole tree with privilege, so it covers them.
@@ -39,6 +47,14 @@ type Softpsp struct{}
 // caches and iproute2, which the forwarder test uses to build veth pairs and a
 // netns. The repo source is mounted at /src.
 func (m *Softpsp) BuilderContainer(src *dagger.Directory) *dagger.Container {
+	return goContainer("iproute2").
+		WithDirectory("/src", src).
+		WithWorkdir("/src")
+}
+
+// goContainer is the Go toolchain image with the shared module and build
+// caches and the given Debian packages.
+func goContainer(pkgs ...string) *dagger.Container {
 	return dag.Container().
 		From(goImage).
 		WithMountedCache("/go/pkg/mod", dag.CacheVolume("softpsp-go-mod")).
@@ -46,9 +62,7 @@ func (m *Softpsp) BuilderContainer(src *dagger.Directory) *dagger.Container {
 		WithMountedCache("/go/build-cache", dag.CacheVolume("softpsp-go-build")).
 		WithEnvVariable("GOCACHE", "/go/build-cache").
 		WithExec([]string{"apt-get", "update", "-qq"}).
-		WithExec([]string{"apt-get", "install", "-y", "-qq", "iproute2"}).
-		WithDirectory("/src", src).
-		WithWorkdir("/src")
+		WithExec(append([]string{"apt-get", "install", "-y", "-qq"}, pkgs...))
 }
 
 // Unit runs go build and go vet over the module, then the tests WITHOUT extra
@@ -94,7 +108,21 @@ func (m *Softpsp) Integration(
 	return runSuite(ctx, m.BuilderContainer(src), goTestArgs(race), []string{"./..."}, true)
 }
 
-// goTestArgs is the `go test` flag vector shared by Unit and Integration.
+// Interop builds psp_encrypt and psp_decrypt from google/psp and runs the
+// interop tests with them: the codec and the KDF against the reference in both
+// directions, and interop/testdata against the reference output.
+func (m *Softpsp) Interop(ctx context.Context, src *dagger.Directory) (string, error) {
+	c := goContainer("libpcap-dev", "libssl-dev").
+		WithDirectory("/psp", dag.Git(pspRefRepo).Commit(pspRefCommit).Tree()).
+		WithExec([]string{"make", "-C", "/psp/src", "psp_encrypt", "psp_decrypt"}).
+		WithEnvVariable("PSP_REF_DIR", "/psp/src").
+		WithEnvVariable("PSP_REF_COMMIT", pspRefCommit).
+		WithDirectory("/src", src).
+		WithWorkdir("/src")
+	return runSuite(ctx, c, goTestArgs(false), []string{"./interop/..."}, false)
+}
+
+// goTestArgs is the `go test` flag vector shared by the lanes.
 func goTestArgs(race bool) []string {
 	args := []string{"-count=1", "-v"}
 	if race {

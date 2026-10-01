@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+// Apoxy changed this file for softpsp.
 
 package control
 
@@ -35,7 +36,7 @@ const (
 // for the given cipher suite. The peer derives the key for this SPI and uses it
 // as its TX key; the sender uses it as its RX key.
 type saOffer struct {
-	Version ICXVersion
+	Version Version
 	RxSPI   uint32
 }
 
@@ -61,7 +62,7 @@ func parseSAOffer(b []byte) (saOffer, error) {
 		return saOffer{}, fmt.Errorf("control: expected SA offer, got message type %d", b[1])
 	}
 	return saOffer{
-		Version: ICXVersion(b[2]),
+		Version: Version(b[2]),
 		RxSPI:   binary.BigEndian.Uint32(b[3:7]),
 	}, nil
 }
