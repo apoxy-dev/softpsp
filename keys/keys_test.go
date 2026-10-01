@@ -583,3 +583,35 @@ func FuzzReceiver(f *testing.F) {
 		}
 	})
 }
+
+func TestApplyRepeatedSPI(t *testing.T) {
+	cases := []struct {
+		name string
+		op   Op
+		lane int
+	}{
+		{"repeated offer", OpOffer, 0},
+		{"repeated rekey", OpRekey, 0},
+		{"move to another lane", OpOffer, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, tab := newReceiver(t, 8, psp.AESGCM128)
+			p := newPeer(t, r, 1)
+			tp := newSender(t).NewPeer()
+			req := offer(t, p, tp, t0)
+			before := tp.SA(0)
+			receive(t, tab, 0, seal(t, before), nil)
+			req.Op, req.SAs[0].Lane = tc.op, tc.lane
+			refused, err := tp.Apply(req, t0.Add(time.Second))
+			if err != nil || !slices.Equal(refused, []uint32{req.SAs[0].SPI}) {
+				t.Fatalf("Apply = %v, %v; want the held SPI refused", refused, err)
+			}
+			if tp.SA(0) != before || tp.SA(1) != nil {
+				t.Fatal("a repeated SPI changed a transmit SA")
+			}
+			// The receiver must accept the next sequence number.
+			receive(t, tab, 0, seal(t, tp.SA(0)), nil)
+		})
+	}
+}

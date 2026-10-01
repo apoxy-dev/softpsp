@@ -63,7 +63,7 @@ func (s *Sender) Expire(now time.Time) int {
 func (p *TxPeer) SA(lane int) *engine.TxSA { return p.lanes[lane].Load() }
 
 // Apply applies a request from the receiver at now, the time of receipt. It
-// returns the SPIs that it refuses because another receiver gave them.
+// returns the SPIs that the sender already holds, including for this peer.
 func (p *TxPeer) Apply(req Request, now time.Time) ([]uint32, error) {
 	s := p.s
 	switch req.Op {
@@ -83,13 +83,10 @@ func (p *TxPeer) Apply(req Request, now time.Time) ([]uint32, error) {
 		defer s.mu.Unlock()
 		var refused []uint32
 		for i, sa := range req.SAs {
-			if l, ok := s.spis[sa.SPI]; ok {
-				if l.p != p {
-					refused = append(refused, sa.SPI)
-					continue
-				}
-				// The SPI moves to another lane of this peer.
-				p.lanes[l.lane].Store(nil)
+			if _, ok := s.spis[sa.SPI]; ok {
+				// Replacing a held SA would reuse its key and nonce from zero.
+				refused = append(refused, sa.SPI)
+				continue
 			}
 			if prev := p.lanes[sa.Lane].Load(); prev != nil {
 				delete(s.spis, prev.SPI())
