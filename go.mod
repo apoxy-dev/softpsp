@@ -4,6 +4,7 @@ go 1.26.8
 
 require (
 	github.com/cilium/ebpf v0.18.0
+	github.com/gaissmai/bart v0.30.0
 	github.com/google/gopacket v1.1.19
 	github.com/safchain/ethtool v0.6.1
 	github.com/stretchr/testify v1.11.1

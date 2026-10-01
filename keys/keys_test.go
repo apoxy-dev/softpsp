@@ -39,13 +39,22 @@ func newReceiver(tb testing.TB, rowBits int, v psp.Version) (*Receiver, *engine.
 	return r, tab
 }
 
+// testRoutes routes the source of inner to the test peer.
+var testRoutes = func() *engine.Routes[string] {
+	r := new(engine.Routes[string])
+	if err := r.Add(netip.MustParsePrefix("10.1.0.0/24"), "test"); err != nil {
+		panic(err)
+	}
+	return r
+}()
+
 func newPeer(tb testing.TB, r *Receiver, lanes int) *Peer {
 	tb.Helper()
 	p, err := r.NewPeer(PeerConfig{
 		VNI:     testVNI,
-		Sources: []netip.Prefix{netip.MustParsePrefix("10.1.0.0/24")},
 		MTU:     testMTU,
 		Lanes:   lanes,
+		Sources: testRoutes.Sources("test"),
 	})
 	if err != nil {
 		tb.Fatal(err)
@@ -398,22 +407,63 @@ func TestConfigErrors(t *testing.T) {
 	if _, err := NewReceiver(tab, 2); err == nil {
 		t.Error("NewReceiver accepted version 2")
 	}
+	sources := testRoutes.Sources("test")
 	one, _ := NewReceiver(tab, psp.AESGCM128)
-	if _, err := one.NewPeer(PeerConfig{VNI: 1, MTU: testMTU, Lanes: 2}); err == nil {
+	if _, err := one.NewPeer(PeerConfig{VNI: 1, MTU: testMTU, Lanes: 2, Sources: sources}); err == nil {
 		t.Error("NewPeer accepted 2 lanes on a table with 1 queue")
 	}
 	r, _ := newReceiver(t, 4, psp.AESGCM128)
 	for _, lanes := range []int{0, MaxLanes + 1} {
-		if _, err := r.NewPeer(PeerConfig{VNI: 1, MTU: testMTU, Lanes: lanes}); err == nil {
+		if _, err := r.NewPeer(PeerConfig{VNI: 1, MTU: testMTU, Lanes: lanes, Sources: sources}); err == nil {
 			t.Errorf("NewPeer accepted %d lanes", lanes)
 		}
 	}
-	p, _ := r.NewPeer(PeerConfig{VNI: psp.MaxVNI + 1, MTU: testMTU, Lanes: 2})
+	if _, err := r.NewPeer(PeerConfig{VNI: 1, MTU: testMTU, Lanes: 1}); err == nil {
+		t.Error("NewPeer accepted no source check")
+	}
+	p, _ := r.NewPeer(PeerConfig{VNI: psp.MaxVNI + 1, MTU: testMTU, Lanes: 2, Sources: sources})
 	if _, err := p.Offer(t0); err == nil || r.live != [2]int{} || len(r.peers) != 0 {
 		t.Errorf("Offer with a bad VNI: %v, live SAs %v", err, r.live)
 	}
 	if _, err := NewSender(0); err == nil {
 		t.Error("NewSender accepted MTU 0")
+	}
+}
+
+// TestRoutes sends each packet with the SAs of the peer that the route of its
+// destination gives.
+func TestRoutes(t *testing.T) {
+	s := newSender(t)
+	var routes engine.Routes[*TxPeer]
+	var tabs []*engine.RxTable
+	for _, p := range []string{"10.2.0.0/16", "fd00:2::/64"} {
+		r, tab := newReceiver(t, 8, psp.AESGCM128)
+		tp := s.NewPeer()
+		offer(t, newPeer(t, r, 2), tp, t0)
+		if err := routes.Add(netip.MustParsePrefix(p), tp); err != nil {
+			t.Fatal(err)
+		}
+		tabs = append(tabs, tab)
+	}
+	cases := []struct {
+		dst  string
+		want int // Index of the receiver, or -1 for no route.
+	}{{"10.2.3.4", 0}, {"fd00:2::9", 1}, {"10.3.0.1", -1}, {"fd00:3::1", -1}}
+	for _, tc := range cases {
+		tp, ok := routes.Lookup(netip.MustParseAddr(tc.dst))
+		if ok != (tc.want >= 0) {
+			t.Fatalf("Lookup(%s): found %v", tc.dst, ok)
+		}
+		if !ok {
+			continue
+		}
+		for lane := range 2 {
+			pkt := seal(t, tp.SA(lane))
+			receive(t, tabs[tc.want], lane, pkt, nil)
+			if _, _, err := tabs[1-tc.want].Queue(lane).Receive(bytes.Clone(pkt)); err == nil {
+				t.Fatalf("%s: the other receiver accepted the packet", tc.dst)
+			}
+		}
 	}
 }
 

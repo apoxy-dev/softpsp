@@ -4,6 +4,7 @@ package keys
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -33,12 +34,13 @@ type Receiver struct {
 
 // PeerConfig is the receive policy for the SAs of one sender.
 type PeerConfig struct {
-	VNI     uint32
-	Sources []netip.Prefix // Allowed inner source addresses.
-	MTU     int            // Inner MTU. It sets the packet limit.
+	VNI uint32
+	MTU int // Inner MTU. It sets the packet limit.
 	// Lanes is the number of SAs, 1 to the queue count of the table. Queue i
 	// owns lane i. With one lane, the queue of the first packet owns the SA.
 	Lanes int
+	// Sources is the source check of the SAs, for example Routes.Sources.
+	Sources func(netip.Addr) bool
 }
 
 // Peer is one sender of a Receiver.
@@ -99,10 +101,12 @@ func (r *Receiver) Rotate() error {
 
 // NewPeer returns a peer with no SAs.
 func (r *Receiver) NewPeer(cfg PeerConfig) (*Peer, error) {
-	if cfg.Lanes < 1 || cfg.Lanes > r.table.Queues() {
+	switch {
+	case cfg.Lanes < 1 || cfg.Lanes > r.table.Queues():
 		return nil, fmt.Errorf("keys: lanes must be 1 to %d, got %d", r.table.Queues(), cfg.Lanes)
+	case cfg.Sources == nil:
+		return nil, errors.New("keys: no source check")
 	}
-	cfg.Sources = slices.Clone(cfg.Sources)
 	return &Peer{r: r, cfg: cfg, lanes: make([]*rxSA, cfg.Lanes)}, nil
 }
 

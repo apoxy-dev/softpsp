@@ -18,7 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -70,9 +69,11 @@ type RxSA struct {
 	MasterIndex int    // 0 or 1. Bit 31 of the SPI.
 	Version     psp.Version
 	VNI         uint32
-	Sources     []netip.Prefix // Allowed inner source addresses.
-	MTU         int            // Inner MTU. It sets the packet limit.
-	Lane        int            // Owner queue, or AnyQueue.
+	MTU         int // Inner MTU. It sets the packet limit.
+	Lane        int // Owner queue, or AnyQueue.
+	// Sources reports whether an inner source address is allowed, for example
+	// Routes.Sources. It runs for each packet and must not lock or allocate.
+	Sources func(netip.Addr) bool
 }
 
 // RxStats are the counters of one receive SA.
@@ -108,7 +109,7 @@ type rxRow struct {
 	maxLen  int   // Longest PSP packet that a hand-off copies.
 	expires int64 // Unix nanoseconds.
 	aead    cipher.AEAD
-	sources []netip.Prefix
+	sources func(netip.Addr) bool
 	owner   atomic.Int32 // Owner queue. AnyQueue until the first packet passes.
 
 	// Only the owner queue writes these, except that ICV failures and rejects
@@ -183,11 +184,8 @@ func (t *RxTable) Add(sa RxSA) (uint32, []byte, error) {
 		return 0, nil, fmt.Errorf("engine: MTU must be positive, got %d", sa.MTU)
 	case sa.Lane != AnyQueue && (sa.Lane < 0 || sa.Lane >= len(t.queues)):
 		return 0, nil, fmt.Errorf("engine: lane must be AnyQueue or 0 to %d, got %d", len(t.queues)-1, sa.Lane)
-	}
-	for _, p := range sa.Sources {
-		if !p.IsValid() {
-			return 0, nil, fmt.Errorf("engine: invalid source prefix %v", p)
-		}
+	case sa.Sources == nil:
+		return 0, nil, errors.New("engine: no source check")
 	}
 
 	t.mu.Lock()
@@ -221,7 +219,7 @@ func (t *RxTable) Add(sa RxSA) (uint32, []byte, error) {
 		maxLen:  sa.MTU + psp.Overhead,
 		expires: time.Now().Add(t.lifetime).UnixNano(),
 		aead:    aead,
-		sources: slices.Clone(sa.Sources),
+		sources: sa.Sources,
 	}
 	row.owner.Store(int32(sa.Lane))
 	t.rows[r].Store(row)
@@ -290,16 +288,10 @@ func (row *rxRow) check(h *psp.Header, inner []byte) error {
 	case h.Seq >= row.limit:
 		return ErrLimit
 	}
-	src, ok := innerSource(inner)
-	if !ok {
+	if src, ok := innerSource(inner); !ok || !row.sources(src) {
 		return ErrSource
 	}
-	for _, p := range row.sources {
-		if p.Contains(src) {
-			return nil
-		}
-	}
-	return ErrSource
+	return nil
 }
 
 // innerSource returns the source address of an IPv4 or IPv6 packet. psp.Open

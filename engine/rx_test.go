@@ -22,13 +22,25 @@ var (
 	src6       = netip.MustParseAddr("fd00:1::5")
 )
 
+// testRoutes gives the test SAs the sources 10.1.0.0/24 and fd00:1::/64, but
+// not 10.1.0.64/26, which another peer has.
+var testRoutes = func() *Routes[string] {
+	r := new(Routes[string])
+	for p, peer := range map[string]string{"10.1.0.0/24": "test", "fd00:1::/64": "test", "10.1.0.64/26": "other"} {
+		if err := r.Add(netip.MustParsePrefix(p), peer); err != nil {
+			panic(err)
+		}
+	}
+	return r
+}()
+
 func testSA() RxSA {
 	return RxSA{
 		Master:  testMaster,
 		Version: psp.AESGCM128,
 		VNI:     0x123,
-		Sources: []netip.Prefix{netip.MustParsePrefix("10.1.0.0/24"), netip.MustParsePrefix("fd00:1::/64")},
 		MTU:     1280,
+		Sources: testRoutes.Sources("test"),
 	}
 }
 
@@ -137,6 +149,9 @@ func TestReceive(t *testing.T) {
 		{name: "other VNI", steps: []step{{seq: 1, edit: otherVNI, want: ErrVNI}, {seq: 1}}},
 		{name: "IPv4 source", steps: []step{
 			{seq: 1, inner: from("10.2.0.5"), want: ErrSource}, {seq: 1, inner: from("10.1.0.255")},
+		}},
+		{name: "source of other peer", steps: []step{
+			{seq: 1, inner: from("10.1.0.70"), want: ErrSource}, {seq: 1, inner: from("10.1.0.130")},
 		}},
 		{name: "IPv6 source", steps: []step{
 			{seq: 1, inner: from("fd00:2::5"), want: ErrSource}, {seq: 1, inner: from("fd00:1::ffff")},
@@ -295,7 +310,7 @@ func TestAdd(t *testing.T) {
 		{"version 2", func(sa *RxSA) { sa.Version = 2 }},
 		{"VNI too big", func(sa *RxSA) { sa.VNI = psp.MaxVNI + 1 }},
 		{"MTU 0", func(sa *RxSA) { sa.MTU = 0 }},
-		{"invalid prefix", func(sa *RxSA) { sa.Sources = []netip.Prefix{{}} }},
+		{"no source check", func(sa *RxSA) { sa.Sources = nil }},
 		{"lane of no queue", func(sa *RxSA) { sa.Lane = 1 }},
 		{"lane -2", func(sa *RxSA) { sa.Lane = -2 }},
 	}
@@ -420,7 +435,7 @@ func FuzzReceive(f *testing.F) {
 		}
 		src, ok := innerSource(got)
 		if !bytes.Equal(got, inner) || vni != sa.VNI || flags&psp.FlagSeq == 0 || seq >= psp.PacketLimit(sa.MTU) ||
-			!ok || !(sa.Sources[0].Contains(src) || sa.Sources[1].Contains(src)) {
+			!ok || !sa.Sources(src) {
 			t.Fatalf("Receive accepted seq %d flags %#x VNI %#x inner %x", seq, flags, vni, inner)
 		}
 		if st, _ := tab.Stats(spi); st.Packets == 0 {
