@@ -15,7 +15,8 @@ const (
 	handoffLimit = 64  // Packets of one SA that can wait for its owner queue.
 )
 
-// RxQueue is one receive queue. Only one goroutine at a time can use it.
+// RxQueue is one receive queue. Only one goroutine at a time can call
+// Receive, Accept or Drain on it. Open is safe for concurrent use.
 type RxQueue struct {
 	t     *RxTable
 	id    int32
@@ -58,49 +59,87 @@ func (q *RxQueue) Stats() QueueStats {
 	}
 }
 
+// Opened is a packet that Open passed. Give it to Accept.
+type Opened struct {
+	VNI uint32
+
+	row   *rxRow
+	seq   uint32
+	claim bool // The SA had no owner queue at Open.
+}
+
 // Receive checks and decrypts the PSP packet pkt in place. It returns the
 // inner packet, which is in pkt, and the VNI. If another queue owns the SA, it
-// copies pkt to that queue and returns ErrHandoff.
+// copies pkt to that queue and returns ErrHandoff. It is Open, then Accept.
 func (q *RxQueue) Receive(pkt []byte) ([]byte, uint32, error) {
+	inner, o, err := q.Open(pkt)
+	if err == nil {
+		err = q.accept(o)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	return inner, o.VNI, nil
+}
+
+// Open is Receive without the replay window. It writes only atomic counters,
+// so many goroutines can call Open on q at once. Give each packet that passes
+// to Accept on q, in packet order.
+func (q *RxQueue) Open(pkt []byte) ([]byte, Opened, error) {
 	h, err := psp.ParseHeader(pkt)
 	if err != nil {
 		q.nomatch.Add(1)
-		return nil, 0, err
+		return nil, Opened{}, err
 	}
 	row := q.t.rows[h.SPI&q.t.rowMask].Load()
 	if row == nil || row.spi != h.SPI || row.version != h.Version {
 		q.nomatch.Add(1)
-		return nil, 0, ErrUnknownSA
+		return nil, Opened{}, ErrUnknownSA
 	}
 	owner := row.owner.Load()
 	if owner != q.id && owner != AnyQueue {
-		return nil, 0, q.handoff(row, owner, pkt)
+		return nil, Opened{}, q.handoff(row, owner, pkt)
 	}
 	inner, err := psp.OpenInPlace(row.aead, pkt)
 	if errors.Is(err, psp.ErrAuth) {
 		row.icvFailures.Add(1)
-		return nil, 0, err
+		return nil, Opened{}, err
 	}
 	if err == nil {
 		err = row.check(&h, inner)
 	}
 	if err != nil {
 		row.rejects.Add(1)
-		return nil, 0, err
+		return nil, Opened{}, err
 	}
-	// Another queue can claim the SA after the Load above. Its packet came
-	// first, so this one drops.
-	if owner == AnyQueue && !row.owner.CompareAndSwap(AnyQueue, q.id) {
+	return inner, Opened{VNI: h.VNI, row: row, seq: h.Seq, claim: owner == AnyQueue}, nil
+}
+
+// Accept checks the replay window for a packet that Open on q passed, and
+// counts the packet. The packet drops if its SA was removed after Open.
+func (q *RxQueue) Accept(o Opened) error {
+	if q.t.rows[o.row.spi&q.t.rowMask].Load() != o.row {
+		q.nomatch.Add(1)
+		return ErrUnknownSA
+	}
+	return q.accept(o)
+}
+
+func (q *RxQueue) accept(o Opened) error {
+	row := o.row
+	// Another queue can claim the SA after Open. Its packet came first, so
+	// this one drops. An earlier Accept on q can also claim it.
+	if o.claim && !row.owner.CompareAndSwap(AnyQueue, q.id) && row.owner.Load() != q.id {
 		q.handoffDrops.Add(1)
-		return nil, 0, ErrHandoffDrop
+		return ErrHandoffDrop
 	}
-	if !row.window.Check(h.Seq) {
+	if !row.window.Check(o.seq) {
 		row.replays.Add(1)
-		return nil, 0, ErrReplay
+		return ErrReplay
 	}
 	row.seq.Store(row.window.Last())
 	row.packets.Add(1)
-	return inner, h.VNI, nil
+	return nil
 }
 
 // Drain receives the packets that other queues gave to q, and calls deliver

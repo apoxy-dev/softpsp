@@ -9,6 +9,10 @@
 // Each row has one owner queue, and only that queue writes the replay window
 // and the counters of the row. A packet that arrives on another queue goes to
 // the owner queue through a hand-off with a limit for each SA.
+//
+// A queue can split Receive in two. Open decrypts and checks a packet, and
+// many goroutines can run it at once. Accept then checks the replay window on
+// one goroutine, in packet order.
 package engine
 
 import (
@@ -112,8 +116,8 @@ type rxRow struct {
 	sources func(netip.Addr) bool
 	owner   atomic.Int32 // Owner queue. AnyQueue until the first packet passes.
 
-	// Only the owner queue writes these, except that ICV failures and rejects
-	// can come from any queue while the owner is AnyQueue.
+	// Only Accept on the owner queue writes window, seq, packets and replays.
+	// Open counts ICV failures and rejects, on more than one goroutine.
 	window                                 replay.Window
 	seq                                    atomic.Uint32 // window.Last() for Stats.
 	packets, icvFailures, replays, rejects atomic.Uint64

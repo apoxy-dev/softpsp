@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/apoxy-dev/softpsp/psp"
 	"github.com/apoxy-dev/softpsp/replay"
@@ -122,6 +124,195 @@ func TestReceiveConcurrent(t *testing.T) {
 	}
 	if len(passed) != queues*n {
 		t.Fatalf("%d packets passed, want %d", len(passed), queues*n)
+	}
+}
+
+// TestOpenParallel opens each batch of packets on several goroutines, while one
+// goroutine accepts the batch before it in packet order, as a read loop with
+// helpers. The results must be the same as from Receive in packet order.
+func TestOpenParallel(t *testing.T) {
+	const batch, rounds = 64, 40
+	cases := []struct {
+		name    string
+		lane    int
+		workers int
+	}{
+		{"owner queue", 0, 4},
+		{"any queue", AnyQueue, 4},
+		{"one worker", 0, 1},
+	}
+	type slot struct {
+		pkt   []byte
+		inner []byte
+		o     Opened
+		err   error
+		want  error
+		id    uint32
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tab := newQueues(t, 1)
+			q := tab.Queue(0)
+			var spis [2]uint32
+			var ss [2]*sender
+			for i := range ss {
+				spis[i], ss[i] = addLane(t, tab, tc.lane)
+			}
+			var seq [2]uint32
+			var want [2]RxStats
+			// build fills b with round r. Each SA gets a forged packet, a copy
+			// of an earlier packet and a packet from a source that is not
+			// allowed. Those do not use a sequence number.
+			build := func(b []slot, r int) {
+				for i := range b {
+					sa, sl := i%2, &b[i]
+					sl.id = uint32(r*batch + i)
+					inner := ipPacket(src4, 60)
+					binary.BigEndian.PutUint32(inner[20:], sl.id)
+					sl.want = nil
+					switch i % 16 {
+					case 5:
+						sl.pkt = ss[sa].seal(t, seq[sa], inner, nil)
+						sl.pkt[len(sl.pkt)-1] ^= 1
+						sl.want = psp.ErrAuth
+						want[sa].ICVFailures++
+					case 9:
+						sl.pkt = bytes.Clone(b[i-2].pkt)
+						sl.id = b[i-2].id
+						sl.want = ErrReplay
+						want[sa].Replays++
+					case 12:
+						sl.pkt = ss[sa].seal(t, seq[sa], ipPacket(netip.MustParseAddr("10.2.0.5"), 60), nil)
+						sl.want = ErrSource
+						want[sa].Rejects++
+					default:
+						sl.pkt = ss[sa].seal(t, seq[sa], inner, nil)
+						want[sa].Packets++
+						want[sa].Seq = seq[sa]
+						seq[sa]++
+					}
+				}
+			}
+			open := func(b []slot) *sync.WaitGroup {
+				var wg sync.WaitGroup
+				n := (len(b) + tc.workers - 1) / tc.workers
+				for w := range tc.workers {
+					chunk := b[w*n : min((w+1)*n, len(b))]
+					wg.Go(func() {
+						for i := range chunk {
+							sl := &chunk[i]
+							sl.inner, sl.o, sl.err = q.Open(sl.pkt)
+						}
+					})
+				}
+				return &wg
+			}
+			var bufs [2][batch]slot
+			build(bufs[0][:], 0)
+			wg := open(bufs[0][:])
+			for r := range rounds {
+				wg.Wait()
+				cur := bufs[r%2][:]
+				if r+1 < rounds {
+					build(bufs[(r+1)%2][:], r+1)
+					wg = open(bufs[(r+1)%2][:])
+				}
+				for i := range cur {
+					sl := &cur[i]
+					err := sl.err
+					if err == nil {
+						err = q.Accept(sl.o)
+					}
+					if !errors.Is(err, sl.want) {
+						t.Fatalf("round %d packet %d: got %v, want %v", r, i, err, sl.want)
+					}
+					if err == nil && (binary.BigEndian.Uint32(sl.inner[20:]) != sl.id || sl.o.VNI != testSA().VNI) {
+						t.Fatalf("round %d packet %d: got inner %x VNI %#x", r, i, sl.inner, sl.o.VNI)
+					}
+				}
+			}
+			for i, spi := range spis {
+				if got, _ := tab.Stats(spi); got != want[i] {
+					t.Fatalf("SA %d: stats %+v, want %+v", i, got, want[i])
+				}
+			}
+			if st := q.Stats(); st != (QueueStats{}) {
+				t.Fatalf("queue stats %+v", st)
+			}
+		})
+	}
+}
+
+// TestAccept checks changes to the SA between Open and Accept on queue 0.
+func TestAccept(t *testing.T) {
+	inner := ipPacket(src4, 60)
+	open := func(t *testing.T, q *RxQueue, pkt []byte) Opened {
+		t.Helper()
+		_, o, err := q.Open(pkt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return o
+	}
+	cases := []struct {
+		name   string
+		queues int
+		lane   int
+		// run opens packets on queue 0 and changes the table. Accept then
+		// gets the packets in order.
+		run   func(t *testing.T, tab *RxTable, spi uint32, s *sender) []Opened
+		want  []error
+		stats QueueStats
+	}{
+		{"deleted", 1, 0, func(t *testing.T, tab *RxTable, spi uint32, s *sender) []Opened {
+			o := open(t, tab.Queue(0), s.seal(t, 1, inner, nil))
+			tab.Delete(spi)
+			return []Opened{o}
+		}, []error{ErrUnknownSA}, QueueStats{NoMatch: 1}},
+		{"row used again", 1, 0, func(t *testing.T, tab *RxTable, spi uint32, s *sender) []Opened {
+			o := open(t, tab.Queue(0), s.seal(t, 1, inner, nil))
+			tab.Delete(spi)
+			add(t, tab, testSA())
+			return []Opened{o}
+		}, []error{ErrUnknownSA}, QueueStats{NoMatch: 1}},
+		{"expired", 1, 0, func(t *testing.T, tab *RxTable, spi uint32, s *sender) []Opened {
+			o := open(t, tab.Queue(0), s.seal(t, 1, inner, nil))
+			tab.Expire(time.Now().Add(DefaultLifetime))
+			return []Opened{o}
+		}, []error{ErrUnknownSA}, QueueStats{NoMatch: 1}},
+		{"other queue claims first", 2, AnyQueue, func(t *testing.T, tab *RxTable, spi uint32, s *sender) []Opened {
+			o := open(t, tab.Queue(0), s.seal(t, 1, inner, nil))
+			if _, _, err := tab.Queue(1).Receive(s.seal(t, 2, inner, nil)); err != nil {
+				t.Fatal(err)
+			}
+			return []Opened{o}
+		}, []error{ErrHandoffDrop}, QueueStats{HandoffDrops: 1}},
+		{"two packets before the claim", 2, AnyQueue, func(t *testing.T, tab *RxTable, spi uint32, s *sender) []Opened {
+			q := tab.Queue(0)
+			return []Opened{open(t, q, s.seal(t, 1, inner, nil)), open(t, q, s.seal(t, 2, inner, nil))}
+		}, []error{nil, nil}, QueueStats{}},
+		{"same seq twice", 1, 0, func(t *testing.T, tab *RxTable, spi uint32, s *sender) []Opened {
+			q := tab.Queue(0)
+			return []Opened{open(t, q, s.seal(t, 5, inner, nil)), open(t, q, s.seal(t, 5, inner, nil))}
+		}, []error{nil, ErrReplay}, QueueStats{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tab, err := NewRxTable(RxConfig{RowBits: 1, Queues: tc.queues}) // One row.
+			if err != nil {
+				t.Fatal(err)
+			}
+			spi, s := addLane(t, tab, tc.lane)
+			q := tab.Queue(0)
+			for i, o := range tc.run(t, tab, spi, s) {
+				if err := q.Accept(o); !errors.Is(err, tc.want[i]) {
+					t.Fatalf("packet %d: got %v, want %v", i, err, tc.want[i])
+				}
+			}
+			if st := q.Stats(); st != tc.stats {
+				t.Fatalf("queue stats %+v, want %+v", st, tc.stats)
+			}
+		})
 	}
 }
 
