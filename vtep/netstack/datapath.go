@@ -88,10 +88,29 @@ type Datapath struct {
 	closeOnce sync.Once
 
 	// Send state. Only the send pump uses it.
+	pkt    pktBuf // One packet of the endpoint.
 	segs   tcpSegs
 	bufs   [maxBatchSize]*[]byte // The pool buffers of the batch.
 	frames [maxBatchSize][]byte  // The frames of the batch.
 	nf     int                   // The number of frames in the batch.
+}
+
+// pktBuf holds one packet of the endpoint. It is the io.Writer of ReadTo.
+type pktBuf struct{ b []byte }
+
+func (p *pktBuf) Write(b []byte) (int, error) {
+	p.b = append(p.b, b...)
+	return len(b), nil
+}
+
+// take copies the headers and the payload of pkt into p and returns the
+// packet. ToView would clear a 64 KiB chunk for each packet.
+func (p *pktBuf) take(pkt *stack.PacketBuffer) []byte {
+	p.b = append(p.b[:0], pkt.LinkHeader().Slice()...)
+	p.b = append(p.b, pkt.NetworkHeader().Slice()...)
+	p.b = append(p.b, pkt.TransportHeader().Slice()...)
+	_, _ = pkt.Data().ReadTo(p, true)
+	return p.b
 }
 
 var _ vtep.Datapath = (*Datapath)(nil)
@@ -119,6 +138,7 @@ func New(cfg Config) (*Datapath, error) {
 		flush:    flush,
 		wake:     make(chan struct{}, 1),
 		done:     make(chan struct{}),
+		pkt:      pktBuf{b: make([]byte, 0, 1<<16)},
 		pktPool: sync.Pool{
 			New: func() any {
 				b := make([]byte, 0, 65535)
@@ -207,11 +227,9 @@ func (d *Datapath) sendQueued() error {
 		}
 		gso := pkt.GSOOptions
 		ipLen := len(pkt.NetworkHeader().Slice())
-		view := pkt.ToView()
+		p := d.pkt.take(pkt)
 		pkt.DecRef()
-		err := d.addPacket(view.AsSlice(), gso, ipLen)
-		view.Release()
-		if err != nil {
+		if err := d.addPacket(p, gso, ipLen); err != nil {
 			return err
 		}
 	}

@@ -278,6 +278,43 @@ func benchPackets(gso bool) (pkts [][]byte, mss, size int) {
 	return pkts, 0, len(payload)
 }
 
+// TestPktBufTake copies packets with consumed headers, as the tests make
+// them, and with pushed headers, as the stack makes them. The copy must equal
+// ToView, and the buffer must not grow for a packet that fits.
+func TestPktBufTake(t *testing.T) {
+	v4a, v4b := netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2")
+	v6a, v6b := netip.MustParseAddr("fd00::1"), netip.MustParseAddr("fd00::2")
+	pushed := func(p []byte, ipLen int) *stack.PacketBuffer {
+		tcpLen := header.TCPMinimumSize + tcpOpts
+		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			ReserveHeaderBytes: ipLen + tcpLen,
+			Payload:            buffer.MakeWithData(p[ipLen+tcpLen:]),
+		})
+		copy(pkb.TransportHeader().Push(tcpLen), p[ipLen:ipLen+tcpLen])
+		copy(pkb.NetworkHeader().Push(ipLen), p[:ipLen])
+		return pkb
+	}
+	cases := []struct {
+		name string
+		pkt  *stack.PacketBuffer
+	}{
+		{"v4 consumed header", newPacket(tcpPacket(v4a, v4b, 1, 0, 0, header.TCPFlagAck, pattern(100), false), header.IPv4MinimumSize, 0)},
+		{"v6 GSO consumed header", newPacket(tcpPacket(v6a, v6b, 1, 0, 0, header.TCPFlagAck, pattern(60000), true), header.IPv6MinimumSize, 1208)},
+		{"v6 pushed headers", pushed(tcpPacket(v6a, v6b, 1, 0, 0, header.TCPFlagAck, pattern(3000), true), header.IPv6MinimumSize)},
+	}
+	p := pktBuf{b: make([]byte, 0, 1<<16)}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer tc.pkt.DecRef()
+			want := tc.pkt.ToView()
+			defer want.Release()
+			got := p.take(tc.pkt)
+			assert.Equal(t, want.AsSlice(), got)
+			assert.Equal(t, 1<<16, cap(got))
+		})
+	}
+}
+
 // BenchmarkSendQueued writes the packets to the endpoint and sends them.
 func BenchmarkSendQueued(b *testing.B) {
 	for _, gso := range []bool{true, false} {
