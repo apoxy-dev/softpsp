@@ -95,8 +95,8 @@ func (m *Softpsp) Unit(
 // XDP redirect-program load actually run rather than failing on EPERM. It is
 // the superset of the Unit tests.
 //
-// It is safe on a kernel without CONFIG_XDP_SOCKETS — the AF_XDP tests gate
-// themselves at runtime and skip cleanly; the lane just covers less.
+// It is safe on a kernel without CONFIG_XDP_SOCKETS — the AF_XDP tests probe
+// for it at runtime and skip cleanly; the lane just covers less.
 func (m *Softpsp) Integration(
 	ctx context.Context,
 	src *dagger.Directory,
