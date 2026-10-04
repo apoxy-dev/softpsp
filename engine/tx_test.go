@@ -73,6 +73,58 @@ func TestTxSALimit(t *testing.T) {
 	}
 }
 
+// TestTxSAReserve reserves sequence numbers in order and seals the packets
+// in another order. Sent in Reserve order, the receiver accepts all of them.
+func TestTxSAReserve(t *testing.T) {
+	const n = 64
+	cases := []struct {
+		name  string
+		order func(i int) int // The index of the i-th seal.
+	}{
+		{"in order", func(i int) int { return i }},
+		{"reverse", func(i int) int { return n - 1 - i }},
+		{"interleaved", func(i int) int { return i/2 + i%2*(n/2) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tab := newTable(t, 4)
+			tx := addTx(t, tab, testSA())
+			inner := ipPacket(src4, 100)
+			seqs := make([]uint64, n)
+			for i := range seqs {
+				seq, err := tx.Reserve()
+				if err != nil || seq != uint64(i) {
+					t.Fatalf("Reserve %d: %d, %v", i, seq, err)
+				}
+				seqs[i] = seq
+			}
+			pkts := make([][]byte, n)
+			for i := range n {
+				j := tc.order(i)
+				pkt := make([]byte, len(inner)+psp.Overhead)
+				m, err := tx.SealSeq(seqs[j], pkt, inner)
+				if err != nil {
+					t.Fatal(err)
+				}
+				pkts[j] = pkt[:m]
+			}
+			for i, pkt := range pkts {
+				h, err := psp.ParseHeader(pkt)
+				if err != nil || h.Seq != uint32(i) || h.IV != uint64(i) {
+					t.Fatalf("packet %d: header %+v, %v", i, h, err)
+				}
+				if got, _, err := tab.Queue(0).Receive(pkt); err != nil || !bytes.Equal(got, inner) {
+					t.Fatalf("Receive %d: %v", i, err)
+				}
+			}
+			tx.next.Store(uint64(tx.limit))
+			if _, err := tx.Reserve(); !errors.Is(err, ErrLimit) {
+				t.Fatalf("Reserve after the limit: got %v, want %v", err, ErrLimit)
+			}
+		})
+	}
+}
+
 func TestNewTxSA(t *testing.T) {
 	key := make([]byte, 16)
 	cases := []struct {

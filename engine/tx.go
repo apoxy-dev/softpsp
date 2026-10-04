@@ -50,10 +50,26 @@ func (s *TxSA) SPI() uint32 { return s.spi }
 // returns the PSP packet length. It returns ErrLimit when the SA has no
 // sequence numbers left. A sequence number is never used twice.
 func (s *TxSA) Seal(dst, inner []byte) (int, error) {
+	seq, err := s.Reserve()
+	if err != nil {
+		return 0, err
+	}
+	return s.SealSeq(seq, dst, inner)
+}
+
+// Reserve takes the next sequence number for SealSeq. Use it when the seals
+// run on many goroutines but the packets go out in Reserve order, so that
+// the replay window of the receiver sees them in order.
+func (s *TxSA) Reserve() (uint64, error) {
 	seq := s.next.Add(1) - 1
 	if seq >= uint64(s.limit) {
 		return 0, ErrLimit
 	}
+	return seq, nil
+}
+
+// SealSeq is Seal with the sequence number seq from Reserve.
+func (s *TxSA) SealSeq(seq uint64, dst, inner []byte) (int, error) {
 	h := psp.Header{Version: s.version, SPI: s.spi, IV: seq, VNI: s.vni, Flags: psp.FlagSeq, Seq: uint32(seq)}
 	return psp.Seal(s.aead, h, dst, inner)
 }

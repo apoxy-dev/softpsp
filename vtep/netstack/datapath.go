@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,6 +88,10 @@ type Datapath struct {
 	pktPool   sync.Pool
 	closeOnce sync.Once
 
+	// pipe seals the frames on other goroutines and sends them in order. Nil
+	// when the send pump seals and sends the frames itself.
+	pipe *txPipe
+
 	// Send state. Only the send pump uses it.
 	pkt    pktBuf // One packet of the endpoint.
 	segs   tcpSegs
@@ -146,6 +151,11 @@ func New(cfg Config) (*Datapath, error) {
 			},
 		},
 	}
+	if eng, ok := cfg.Engine.(Sealer); ok {
+		if w := sealWorkers(runtime.GOMAXPROCS(0)); w > 0 {
+			d.pipe = newTxPipe(d, eng, w)
+		}
+	}
 	d.notifyHandle = d.ep.AddNotify(d)
 	return d, nil
 }
@@ -190,6 +200,12 @@ func (d *Datapath) Run(ctx context.Context) error {
 
 	g.Go(d.outbound)
 	g.Go(d.inbound)
+	if d.pipe != nil {
+		g.Go(d.pipe.run)
+		for range d.pipe.workers {
+			g.Go(d.pipe.seal)
+		}
+	}
 
 	if err := g.Wait(); err != nil && !errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("netstack datapath splicing failed: %w", err)
@@ -197,8 +213,9 @@ func (d *Datapath) Run(ctx context.Context) error {
 	return nil
 }
 
-// outbound sends the packets of the endpoint and the frames of the engine
-// until Close.
+// outbound is the send pump. It sends the packets of the endpoint and the
+// frames of the engine until Close. With a pipe, it only reads and cuts the
+// packets, and the pipe seals and sends the frames.
 func (d *Datapath) outbound() error {
 	ticker := time.NewTicker(d.flush)
 	defer ticker.Stop()
@@ -232,6 +249,13 @@ func (d *Datapath) sendQueued() error {
 		if err := d.addPacket(p, gso, ipLen); err != nil {
 			return err
 		}
+	}
+	if d.pipe != nil {
+		if err := d.pipe.toPhy(); err != nil {
+			return err
+		}
+		d.pipe.flush()
+		return nil
 	}
 	for {
 		if d.nf == maxBatchSize {
@@ -267,9 +291,12 @@ func (d *Datapath) addPacket(pkt []byte, gso stack.GSO, ipLen int) error {
 	return nil
 }
 
-// add adds the frame of the IP packet virt to the batch. It sends the batch
-// first when it is full.
+// add adds the frame of the IP packet virt to the batch, or to the pipe. It
+// sends the batch first when it is full.
 func (d *Datapath) add(virt []byte) error {
+	if d.pipe != nil {
+		return d.pipe.add(virt)
+	}
 	if d.nf == maxBatchSize {
 		if err := d.send(); err != nil {
 			return err
@@ -294,26 +321,10 @@ func (d *Datapath) slot() []byte {
 	return (*b)[:cap(*b)]
 }
 
-// send writes the batch to the underlay and empties it. It sends again the
-// frames that a short write did not send. It logs a failed write, and returns
-// an error only when the underlay or the datapath closes.
+// send writes the batch to the underlay and empties it. It returns an error
+// only when the underlay or the datapath closes.
 func (d *Datapath) send() error {
-	out := d.frames[:d.nf]
-	var err error
-	for len(out) > 0 {
-		n, werr := d.underlay.WriteFrames(out)
-		if n > 0 {
-			out = out[n:]
-		}
-		if werr != nil {
-			err = werr
-			break
-		}
-		if n == 0 {
-			err = fmt.Errorf("netstack datapath: underlay write stalled, %d frames undelivered", len(out))
-			break
-		}
-	}
+	err := d.write(d.frames[:d.nf])
 	for i, b := range d.bufs {
 		if b != nil {
 			d.pktPool.Put(b)
@@ -323,10 +334,7 @@ func (d *Datapath) send() error {
 	}
 	d.nf = 0
 	if err != nil {
-		if errors.Is(err, net.ErrClosed) {
-			return err
-		}
-		slog.Warn("Error writing batched underlay frames", slog.Any("error", err))
+		return err
 	}
 	select {
 	case <-d.done:
@@ -334,6 +342,31 @@ func (d *Datapath) send() error {
 	default:
 		return nil
 	}
+}
+
+// write writes frames to the underlay. It sends again the frames that a short
+// write did not send. It logs a failed write, and returns an error only when
+// the underlay closes.
+func (d *Datapath) write(frames [][]byte) error {
+	out := frames
+	for len(out) > 0 {
+		n, err := d.underlay.WriteFrames(out)
+		if n > 0 {
+			out = out[n:]
+		}
+		if err == nil && n == 0 {
+			err = fmt.Errorf("netstack datapath: underlay write stalled, %d frames undelivered", len(out))
+		}
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, net.ErrClosed) {
+			return err
+		}
+		slog.Warn("Error writing batched underlay frames", slog.Any("error", err))
+		return nil
+	}
+	return nil
 }
 
 // inbound reads frames from the underlay, decrypts them and gives the IP
