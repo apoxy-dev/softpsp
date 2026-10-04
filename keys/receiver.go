@@ -36,8 +36,9 @@ type Receiver struct {
 type PeerConfig struct {
 	VNI uint32
 	MTU int // Inner MTU. It sets the packet limit.
-	// Lanes is the number of SAs, 1 to the queue count of the table. Queue i
-	// owns lane i. With one lane, the queue of the first packet owns the SA.
+	// Lanes is the number of SAs, 1 to MaxLanes. Queue i modulo the queue
+	// count of the table owns lane i. With one lane, the queue of the first
+	// packet owns the SA.
 	Lanes int
 	// Sources is the source check of the SAs, for example Routes.Sources.
 	Sources func(netip.Addr) bool
@@ -102,8 +103,8 @@ func (r *Receiver) Rotate() error {
 // NewPeer returns a peer with no SAs.
 func (r *Receiver) NewPeer(cfg PeerConfig) (*Peer, error) {
 	switch {
-	case cfg.Lanes < 1 || cfg.Lanes > r.table.Queues():
-		return nil, fmt.Errorf("keys: lanes must be 1 to %d, got %d", r.table.Queues(), cfg.Lanes)
+	case cfg.Lanes < 1 || cfg.Lanes > MaxLanes:
+		return nil, fmt.Errorf("keys: lanes must be 1 to %d, got %d", MaxLanes, cfg.Lanes)
 	case cfg.Sources == nil:
 		return nil, errors.New("keys: no source check")
 	}
@@ -224,7 +225,7 @@ func (p *Peer) replace(lanes []int, now time.Time) ([]SA, error) {
 	sas := make([]SA, 0, len(lanes))
 	made := make([]*rxSA, 0, len(lanes))
 	for _, lane := range lanes {
-		owner := lane
+		owner := lane % r.table.Queues()
 		if len(p.lanes) == 1 {
 			owner = engine.AnyQueue
 		}

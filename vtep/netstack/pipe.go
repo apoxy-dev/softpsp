@@ -47,6 +47,8 @@ type TxFrame struct {
 	Seq uint64
 	// Dst is the address that the frame goes to.
 	Dst netip.AddrPort
+	// Lane is the send lane of the frame.
+	Lane int
 }
 
 // sealWorkers returns the number of seal workers of a send pipe for procs

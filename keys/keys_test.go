@@ -176,6 +176,36 @@ func TestOffer(t *testing.T) {
 	}
 }
 
+// TestLaneOwners checks that queue lane%queues owns each lane of a peer.
+func TestLaneOwners(t *testing.T) {
+	cases := []struct {
+		queues, lanes int
+	}{{1, 4}, {2, 5}, {4, 4}, {1, MaxLanes}}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%d queues %d lanes", tc.queues, tc.lanes), func(t *testing.T) {
+			tab, err := engine.NewRxTable(engine.RxConfig{RowBits: 8, Queues: tc.queues})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := NewReceiver(tab, psp.AESGCM128)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := newPeer(t, r, tc.lanes)
+			tp := newSender(t).NewPeer()
+			offer(t, p, tp, t0)
+			for lane := range tc.lanes {
+				owner := lane % tc.queues
+				if tc.queues > 1 {
+					// Another queue hands the packet to the owner.
+					receive(t, tab, (owner+1)%tc.queues, seal(t, tp.SA(lane)), engine.ErrHandoff)
+				}
+				receive(t, tab, owner, seal(t, tp.SA(lane)), nil)
+			}
+		})
+	}
+}
+
 func TestRekeyTime(t *testing.T) {
 	r, tab := newReceiver(t, 8, psp.AESGCM128)
 	p := newPeer(t, r, 2)
@@ -408,10 +438,6 @@ func TestConfigErrors(t *testing.T) {
 		t.Error("NewReceiver accepted version 2")
 	}
 	sources := testRoutes.Sources("test")
-	one, _ := NewReceiver(tab, psp.AESGCM128)
-	if _, err := one.NewPeer(PeerConfig{VNI: 1, MTU: testMTU, Lanes: 2, Sources: sources}); err == nil {
-		t.Error("NewPeer accepted 2 lanes on a table with 1 queue")
-	}
 	r, _ := newReceiver(t, 4, psp.AESGCM128)
 	for _, lanes := range []int{0, MaxLanes + 1} {
 		if _, err := r.NewPeer(PeerConfig{VNI: 1, MTU: testMTU, Lanes: lanes, Sources: sources}); err == nil {
