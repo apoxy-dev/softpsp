@@ -23,6 +23,7 @@ import (
 
 	"github.com/apoxy-dev/softpsp/vtep"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/cpu"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -92,8 +93,10 @@ type Datapath struct {
 	// when the send pump seals and sends the frames itself.
 	pipe *txPipe
 
-	// Send state. Only the send pump uses it.
-	pkt    pktBuf // One packet of the endpoint.
+	// Send state. Only the send pump uses it, so it has its own cache lines.
+	_      cpu.CacheLinePad
+	pkt    pktBuf          // One packet of the endpoint.
+	hdr    [maxSegHdr]byte // The headers of a TCP packet of the endpoint.
 	segs   tcpSegs
 	bufs   [maxBatchSize]*[]byte // The pool buffers of the batch.
 	frames [maxBatchSize][]byte  // The frames of the batch.
@@ -214,8 +217,8 @@ func (d *Datapath) Run(ctx context.Context) error {
 }
 
 // outbound is the send pump. It sends the packets of the endpoint and the
-// frames of the engine until Close. With a pipe, it only reads and cuts the
-// packets, and the pipe seals and sends the frames.
+// frames of the engine until Close. With a pipe, it only reads the packets,
+// and the pipe cuts them, seals and sends the frames.
 func (d *Datapath) outbound() error {
 	ticker := time.NewTicker(d.flush)
 	defer ticker.Stop()
@@ -242,11 +245,9 @@ func (d *Datapath) sendQueued() error {
 		if pkt == nil {
 			break
 		}
-		gso := pkt.GSOOptions
-		ipLen := len(pkt.NetworkHeader().Slice())
-		p := d.pkt.take(pkt)
+		err := d.addPkt(pkt)
 		pkt.DecRef()
-		if err := d.addPacket(p, gso, ipLen); err != nil {
+		if err != nil {
 			return err
 		}
 	}
@@ -274,45 +275,62 @@ func (d *Datapath) sendQueued() error {
 	return d.send()
 }
 
-// addPacket adds the frames of the IP packet pkt to the batch. A TCP packet
-// with GSO becomes one packet for each MSS of payload.
-func (d *Datapath) addPacket(pkt []byte, gso stack.GSO, ipLen int) error {
-	if gso.Type == stack.GSONone {
-		_, err := d.add(pkt, 0)
-		return err
-	}
-	if !d.segs.init(pkt, ipLen, int(gso.MSS)) {
-		return nil
-	}
-	// Prepare can keep a packet that it drops. Thus a seal worker completes
-	// the TCP checksum only of a packet after one that the pipe took.
-	late := false
-	for seg := d.segs.next(); seg != nil; seg = d.segs.next() {
-		csum := 0
-		if late {
-			csum = ipLen
-		} else {
-			tcpChecksum(seg, ipLen)
-		}
-		ok, err := d.add(seg, csum)
-		if err != nil {
+// addPkt adds the frames of the packet pkt of the endpoint to the batch, or
+// to the pipe. The pipe takes a TCP packet with GSO whole when it can.
+func (d *Datapath) addPkt(pkt *stack.PacketBuffer) error {
+	gso := pkt.GSOOptions
+	if d.pipe != nil && gso.Type != stack.GSONone {
+		if ok, err := d.addSegs(pkt, int(gso.MSS)); ok || err != nil {
 			return err
 		}
-		late = ok && d.pipe != nil
+	}
+	ipLen := len(pkt.NetworkHeader().Slice())
+	return d.addPacket(d.pkt.take(pkt), gso, ipLen)
+}
+
+// addSegs gives the TCP packet pkt to the pipe, and a seal worker cuts it. It
+// returns false when the pump must cut pkt.
+func (d *Datapath) addSegs(pkt *stack.PacketBuffer, mss int) (bool, error) {
+	ip, tcp := pkt.NetworkHeader().Slice(), pkt.TransportHeader().Slice()
+	// A seal worker needs the IP and TCP headers apart from the payload.
+	if len(ip)+len(tcp) > maxSegHdr || len(pkt.LinkHeader().Slice()) > 0 {
+		return false, nil
+	}
+	hdr := append(append(d.hdr[:0], ip...), tcp...)
+	if !d.segs.init(hdr, len(ip), len(hdr)+pkt.Data().Size(), mss) || d.segs.hdrLen != len(hdr) {
+		return false, nil
+	}
+	return d.pipe.addSegs(pkt, hdr, &d.segs)
+}
+
+// addPacket adds the frames of the IP packet pkt to the batch, or to the
+// pipe. A TCP packet with GSO becomes one packet for each MSS of payload.
+func (d *Datapath) addPacket(pkt []byte, gso stack.GSO, ipLen int) error {
+	if gso.Type == stack.GSONone {
+		return d.add(pkt)
+	}
+	if !d.segs.init(pkt, ipLen, len(pkt), int(gso.MSS)) {
+		return nil
+	}
+	for seg := d.segs.next(pkt); seg != nil; seg = d.segs.next(pkt) {
+		// The engine gets whole packets: it can keep one that it drops.
+		tcpChecksum(seg, ipLen)
+		if err := d.add(seg); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 // add adds the frame of the IP packet virt to the batch, or to the pipe. It
-// sends the batch first when it is full. A csum above 0 is for the pipe only.
-// It returns false when the engine dropped the packet.
-func (d *Datapath) add(virt []byte, csum int) (bool, error) {
+// sends the batch first when it is full.
+func (d *Datapath) add(virt []byte) error {
 	if d.pipe != nil {
-		return d.pipe.add(virt, csum)
+		return d.pipe.add(virt)
 	}
 	if d.nf == maxBatchSize {
 		if err := d.send(); err != nil {
-			return false, err
+			return err
 		}
 	}
 	b := d.slot()
@@ -322,7 +340,7 @@ func (d *Datapath) add(virt []byte, csum int) (bool, error) {
 		d.frames[d.nf] = b[:n]
 		d.nf++
 	}
-	return n > 0, nil
+	return nil
 }
 
 // slot returns the buffer for the next frame of the batch.

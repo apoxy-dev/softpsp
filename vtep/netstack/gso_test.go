@@ -54,13 +54,37 @@ func (u *recUnderlay) WriteFrames(frames [][]byte) (int, error) {
 func newPacket(p []byte, ipLen, mss int) *stack.PacketBuffer {
 	pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(p)})
 	pkb.NetworkHeader().Consume(ipLen)
-	if mss > 0 {
-		typ := stack.GSOTCPv4
-		if p[0]>>4 == header.IPv6Version {
-			typ = stack.GSOTCPv6
-		}
-		pkb.GSOOptions = stack.GSO{Type: typ, NeedsCsum: true, MSS: uint16(mss), L3HdrLen: uint16(ipLen)}
+	pkb.GSOOptions = gsoOptions(p, ipLen, mss)
+	return pkb
+}
+
+// gsoOptions returns the GSO options of TCP for the IP packet p, or no GSO
+// for an mss of 0.
+func gsoOptions(p []byte, ipLen, mss int) stack.GSO {
+	if mss == 0 {
+		return stack.GSO{}
 	}
+	typ := stack.GSOTCPv4
+	if p[0]>>4 == header.IPv6Version {
+		typ = stack.GSOTCPv6
+	}
+	return stack.GSO{Type: typ, NeedsCsum: true, MSS: uint16(mss), L3HdrLen: uint16(ipLen)}
+}
+
+// stackPacket returns the TCP packet p as the stack makes it: pushed IP and TCP
+// headers, and the payload in views that start at view bytes and grow 3 times.
+func stackPacket(p []byte, ipLen, mss, view int) *stack.PacketBuffer {
+	hdrLen := ipLen + int(p[ipLen+12]>>4)*4
+	var data buffer.Buffer
+	for n, rest := view, p[hdrLen:]; len(rest) > 0; n = 3*n + 1 {
+		k := min(n, len(rest))
+		data.Append(buffer.NewViewWithData(rest[:k]))
+		rest = rest[k:]
+	}
+	pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{ReserveHeaderBytes: hdrLen, Payload: data})
+	copy(pkb.TransportHeader().Push(hdrLen-ipLen), p[ipLen:hdrLen])
+	copy(pkb.NetworkHeader().Push(ipLen), p[:ipLen])
+	pkb.GSOOptions = gsoOptions(p, ipLen, mss)
 	return pkb
 }
 
@@ -178,81 +202,123 @@ func newTCPStack(t *testing.T, ep *channel.Endpoint, a netip.Addr) *stack.Stack 
 
 // TestDatapathTCPGSO sends TCP from a stack with GSO through two datapaths to
 // another stack. The data must arrive whole, and no frame can be larger than
-// the MTU.
+// the MTU. The datapaths have no pipe, or a pipe whose seal workers cut the
+// TCP packets, also when the engine refuses some of them.
 func TestDatapathTCPGSO(t *testing.T) {
-	for _, pair := range [][2]netip.Addr{
-		{netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2")},
-		{netip.MustParseAddr("fd00::1"), netip.MustParseAddr("fd00::2")},
-	} {
-		t.Run(pair[0].String(), func(t *testing.T) {
-			epA, epB := channel.New(256, testMTU, ""), channel.New(256, testMTU, "")
-			epA.SupportedGSOKind = stack.HostGSOSupported
-			sA, sB := newTCPStack(t, epA, pair[0]), newTCPStack(t, epB, pair[1])
-			uA, uB := newFakeUnderlay(), newFakeUnderlay()
-			var frames, maxLen atomic.Int64
-			// Each underlay sends its frames to the other.
-			cross := func(from, to *fakeUnderlay, count bool) {
-				for {
-					select {
-					case f := <-from.out:
-						if count {
-							frames.Add(1)
-							if n := int64(len(f)); n > maxLen.Load() {
-								maxLen.Store(n)
-							}
-						}
+	third := 0
+	cases := []struct {
+		name    string
+		workers int
+		segs    func([]byte, int, int, int) bool
+	}{
+		{name: "no pipe"},
+		{name: "pipe", workers: 2},
+		{name: "pipe, each third refused", workers: 2, segs: func([]byte, int, int, int) bool { third++; return third%3 != 0 }},
+	}
+	for _, tc := range cases {
+		for _, pair := range [][2]netip.Addr{
+			{netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2")},
+			{netip.MustParseAddr("fd00::1"), netip.MustParseAddr("fd00::2")},
+		} {
+			t.Run(tc.name+"/"+pair[0].String(), func(t *testing.T) {
+				epA, epB := channel.New(256, testMTU, ""), channel.New(256, testMTU, "")
+				epA.SupportedGSOKind = stack.HostGSOSupported
+				sA, sB := newTCPStack(t, epA, pair[0]), newTCPStack(t, epB, pair[1])
+				uA, uB := newFakeUnderlay(), newFakeUnderlay()
+				var frames, maxLen atomic.Int64
+				// Each underlay sends its frames to the other.
+				cross := func(from, to *fakeUnderlay, count bool) {
+					for {
 						select {
-						case to.in <- f:
-						case <-to.closed:
+						case f := <-from.out:
+							if count {
+								frames.Add(1)
+								if n := int64(len(f)); n > maxLen.Load() {
+									maxLen.Store(n)
+								}
+							}
+							select {
+							case to.in <- f:
+							case <-to.closed:
+								return
+							}
+						case <-from.closed:
 							return
 						}
-					case <-from.closed:
-						return
 					}
 				}
-			}
-			go cross(uA, uB, true)
-			go cross(uB, uA, false)
-			defer startDatapath(t, fakeEngine{}, epA, uA)()
-			defer startDatapath(t, fakeEngine{}, epB, uB)()
-
-			proto := ipv4.ProtocolNumber
-			if pair[0].Is6() {
-				proto = ipv6.ProtocolNumber
-			}
-			dst := tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFromSlice(pair[1].AsSlice()), Port: 80}
-			ln, err := gonet.ListenTCP(sB, dst, proto)
-			require.NoError(t, err)
-			defer ln.Close()
-			data := pattern(256 << 10)
-			got := make(chan []byte, 1)
-			go func() {
-				c, err := ln.Accept()
-				if err != nil {
-					got <- nil
-					return
+				go cross(uA, uB, true)
+				go cross(uB, uA, false)
+				overhead := 0
+				if tc.workers == noPipe {
+					defer startDatapath(t, fakeEngine{}, epA, uA)()
+					defer startDatapath(t, fakeEngine{}, epB, uB)()
+				} else {
+					overhead = seqLen
+					defer startPipeDatapath(t, &seqEngine{segs: tc.segs}, epA, uA, tc.workers)()
+					defer startPipeDatapath(t, &seqEngine{}, epB, uB, tc.workers)()
 				}
-				defer c.Close()
-				b, _ := io.ReadAll(c)
-				got <- b
-			}()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			c, err := gonet.DialContextTCP(ctx, sA, dst, proto)
-			require.NoError(t, err)
-			_, err = c.Write(data)
-			require.NoError(t, err)
-			require.NoError(t, c.Close())
-			select {
-			case b := <-got:
-				assert.True(t, bytes.Equal(data, b), "got %d of %d bytes", len(b), len(data))
-			case <-ctx.Done():
-				t.Fatal("the data did not arrive")
-			}
-			assert.LessOrEqual(t, maxLen.Load(), int64(testMTU))
-			// The stack sends fewer packets than the datapath sends frames.
-			assert.Less(t, sA.NICInfo()[1].Stats.Tx.Packets.Value(), uint64(frames.Load()))
-		})
+
+				proto := ipv4.ProtocolNumber
+				if pair[0].Is6() {
+					proto = ipv6.ProtocolNumber
+				}
+				dst := tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFromSlice(pair[1].AsSlice()), Port: 80}
+				ln, err := gonet.ListenTCP(sB, dst, proto)
+				require.NoError(t, err)
+				defer ln.Close()
+				data := pattern(256 << 10)
+				got := make(chan []byte, 1)
+				go func() {
+					c, err := ln.Accept()
+					if err != nil {
+						got <- nil
+						return
+					}
+					defer c.Close()
+					b, _ := io.ReadAll(c)
+					got <- b
+				}()
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				c, err := gonet.DialContextTCP(ctx, sA, dst, proto)
+				require.NoError(t, err)
+				_, err = c.Write(data)
+				require.NoError(t, err)
+				require.NoError(t, c.Close())
+				select {
+				case b := <-got:
+					assert.True(t, bytes.Equal(data, b), "got %d of %d bytes", len(b), len(data))
+				case <-ctx.Done():
+					t.Fatal("the data did not arrive")
+				}
+				assert.LessOrEqual(t, maxLen.Load(), int64(testMTU+overhead))
+				// The stack sends fewer packets than the datapath sends frames.
+				assert.Less(t, sA.NICInfo()[1].Stats.Tx.Packets.Value(), uint64(frames.Load()))
+			})
+		}
+	}
+}
+
+// startPipeDatapath runs a datapath on ep with a send pipe of workers seal
+// workers. The returned function stops it.
+func startPipeDatapath(t *testing.T, eng Sealer, ep *channel.Endpoint, u *fakeUnderlay, workers int) func() {
+	t.Helper()
+	d, err := New(Config{Engine: eng, Endpoint: ep, Underlay: u, FlushInterval: 10 * time.Millisecond})
+	require.NoError(t, err)
+	d.pipe = newTxPipe(d, eng, workers)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	return func() {
+		cancel()
+		u.Close()
+		select {
+		case err := <-done:
+			assert.NoError(t, err)
+		case <-time.After(10 * time.Second):
+			t.Error("Run did not return")
+		}
 	}
 }
 
@@ -284,23 +350,13 @@ func benchPackets(gso bool) (pkts [][]byte, mss, size int) {
 func TestPktBufTake(t *testing.T) {
 	v4a, v4b := netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2")
 	v6a, v6b := netip.MustParseAddr("fd00::1"), netip.MustParseAddr("fd00::2")
-	pushed := func(p []byte, ipLen int) *stack.PacketBuffer {
-		tcpLen := header.TCPMinimumSize + tcpOpts
-		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			ReserveHeaderBytes: ipLen + tcpLen,
-			Payload:            buffer.MakeWithData(p[ipLen+tcpLen:]),
-		})
-		copy(pkb.TransportHeader().Push(tcpLen), p[ipLen:ipLen+tcpLen])
-		copy(pkb.NetworkHeader().Push(ipLen), p[:ipLen])
-		return pkb
-	}
 	cases := []struct {
 		name string
 		pkt  *stack.PacketBuffer
 	}{
 		{"v4 consumed header", newPacket(tcpPacket(v4a, v4b, 1, 0, 0, header.TCPFlagAck, pattern(100), false), header.IPv4MinimumSize, 0)},
 		{"v6 GSO consumed header", newPacket(tcpPacket(v6a, v6b, 1, 0, 0, header.TCPFlagAck, pattern(60000), true), header.IPv6MinimumSize, 1208)},
-		{"v6 pushed headers", pushed(tcpPacket(v6a, v6b, 1, 0, 0, header.TCPFlagAck, pattern(3000), true), header.IPv6MinimumSize)},
+		{"v6 pushed headers", stackPacket(tcpPacket(v6a, v6b, 1, 0, 0, header.TCPFlagAck, pattern(3000), true), header.IPv6MinimumSize, 0, 1)},
 	}
 	p := pktBuf{b: make([]byte, 0, 1<<16)}
 	for _, tc := range cases {

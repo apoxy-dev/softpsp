@@ -30,8 +30,10 @@ import (
 // seqEngine is a Sealer whose frame is the number of Prepare and then the
 // inner packet, so that the frames show the send order.
 type seqEngine struct {
-	seq     uint64            // Prepare runs on the send pump only.
-	drop    func([]byte) bool // Prepare drops these packets.
+	seq  uint64            // Prepare runs on the send pump only.
+	drop func([]byte) bool // Prepare drops these packets.
+	// segs reports whether PrepareSegs takes a TCP packet. Nil takes all.
+	segs    func(hdr []byte, n, size, total int) bool
 	fail    func(uint64) bool // Seal drops the frames with these numbers.
 	shuffle bool              // Seal waits a random time.
 	hold    chan struct{}     // When set, Seal waits until it closes.
@@ -49,6 +51,15 @@ func (e *seqEngine) Prepare(virt []byte, f *TxFrame) bool {
 	}
 	f.Seq = e.seq
 	e.seq++
+	return true
+}
+
+func (e *seqEngine) PrepareSegs(hdr []byte, n, size, total int, f *TxFrame) bool {
+	if e.segs != nil && !e.segs(hdr, n, size, total) {
+		return false
+	}
+	f.Seq = e.seq
+	e.seq += uint64(n)
 	return true
 }
 
@@ -75,7 +86,7 @@ func (e *seqEngine) VirtToPhy(virt, phy []byte) (int, bool) {
 	return e.Seal(&f, virt, phy), false
 }
 
-func (e *seqEngine) PhyToVirt(phy, virt []byte) int { return copy(virt, phy) }
+func (e *seqEngine) PhyToVirt(phy, virt []byte) int { return copy(virt, phy[seqLen:]) }
 
 // ToPhy gives the frames of keep after the first Prepare, so that the pump
 // sends them after the frames of the first packet.
@@ -117,6 +128,12 @@ func (e *pspEngine) Overhead() int { return psp.Overhead }
 
 func (e *pspEngine) Prepare(_ []byte, f *TxFrame) bool {
 	seq, err := e.tx.Reserve()
+	f.SA, f.Seq = e.tx, seq
+	return err == nil
+}
+
+func (e *pspEngine) PrepareSegs(_ []byte, n, _, _ int, f *TxFrame) bool {
+	seq, err := e.tx.ReserveN(n)
 	f.SA, f.Seq = e.tx, seq
 	return err == nil
 }
@@ -229,6 +246,9 @@ type testPacket struct {
 	udp     bool
 	payload int
 	mss     int // Zero writes the packet with no GSO.
+	// flat writes a packet with GSO as newPacket makes it, and not as the
+	// stack makes it. The pump must cut a flat packet.
+	flat bool
 }
 
 func (p testPacket) addrs() (src, dst netip.Addr) {
@@ -253,15 +273,41 @@ func (p testPacket) build(t testing.TB, i int) ([]byte, int) {
 	return tcpPacket(src, dst, uint16(1000+i), uint32(i)<<16, 7, header.TCPFlagAck, pattern(p.payload), p.mss > 0), ipLen
 }
 
+// buffer returns the packet buffer of packet i of a test.
+func (p testPacket) buffer(t testing.TB, i int) *stack.PacketBuffer {
+	b, ipLen := p.build(t, i)
+	if p.mss > 0 && !p.flat {
+		return stackPacket(b, ipLen, p.mss, 1)
+	}
+	return newPacket(b, ipLen, p.mss)
+}
+
 // writeTestPackets writes pkts to ep, one write for each packet.
 func writeTestPackets(t testing.TB, ep *channel.Endpoint, pkts []testPacket) {
 	t.Helper()
 	for i, p := range pkts {
-		b, ipLen := p.build(t, i)
 		var list stack.PacketBufferList
-		list.PushBack(newPacket(b, ipLen, p.mss))
+		list.PushBack(p.buffer(t, i))
 		writePackets(t, ep, &list)
 	}
+}
+
+// srcPort returns the source port of the IP packet, or of the headers, v.
+func srcPort(v []byte) uint16 {
+	if v[0]>>4 == header.IPv6Version {
+		return binary.BigEndian.Uint16(v[header.IPv6MinimumSize:])
+	}
+	return binary.BigEndian.Uint16(v[header.IPv4MinimumSize:])
+}
+
+// tcpSeq returns the offset of the TCP packet v in the data of its test
+// packet.
+func tcpSeq(v []byte) int {
+	ipLen := header.IPv4MinimumSize
+	if v[0]>>4 == header.IPv6Version {
+		ipLen = header.IPv6MinimumSize
+	}
+	return int(binary.BigEndian.Uint32(v[ipLen+4:]) & 0xffff)
 }
 
 // wantPackets returns the inner packets that a datapath must send for pkts, in
@@ -333,26 +379,40 @@ func TestNewPipe(t *testing.T) {
 // TestTxPipe sends packets through a datapath with a send pipe. The frames
 // must equal the frames of a datapath with no pipe: the same frames, in send
 // order, also when the seal workers finish the sets in another order, when
-// Prepare or Seal drops frames, and when the engine has frames of its own.
+// Prepare or Seal drops frames, when PrepareSegs refuses TCP packets, and
+// when the engine has frames of its own.
 func TestTxPipe(t *testing.T) {
+	none := func([]byte, int, int, int) bool { return false }
+	// Five TCP packets with GSO, each of one flow, and a packet with no GSO.
+	flows := []testPacket{{payload: 9000, mss: 500}, {payload: 60_000, mss: 400}, {payload: 30_000, mss: 700}, {payload: 60_000, mss: 400}, {payload: 5000, mss: 1000}, {payload: 50}}
 	cases := []struct {
 		name string
 		pkts []testPacket
 		drop func([]byte) bool
+		segs func(hdr []byte, n, size, total int) bool
 		fail func(uint64) bool
 		keep int
 	}{
 		{name: "GSO and plain", pkts: []testPacket{{payload: 4500, mss: 1000}, {v6: true, payload: 10}, {payload: 1200}, {v6: true, payload: 3000, mss: 1000}}},
 		{name: "many sets", pkts: []testPacket{{payload: 60_000, mss: 400}, {v6: true, payload: 60_000, mss: 400}, {payload: 60_000, mss: 400}}},
-		{name: "Prepare drops", pkts: []testPacket{{payload: 60_000, mss: 400}, {payload: 50}}, drop: func(v []byte) bool { return v[len(v)-1]%5 == 0 }},
+		{name: "small packets", pkts: []testPacket{{mss: 1000}, {v6: true, payload: 1, mss: 1000}, {payload: 100, mss: 7}, {v6: true, mss: 1000}}},
+		{name: "flat packets", pkts: []testPacket{{payload: 4500, mss: 1000, flat: true}, {v6: true, payload: 60_000, mss: 400}, {v6: true, payload: 60_000, mss: 400, flat: true}}},
+		{name: "Prepare drops", pkts: []testPacket{{payload: 60_000, mss: 400}, {payload: 50}}, segs: none, drop: func(v []byte) bool { return v[len(v)-1]%5 == 0 }},
 		{name: "Seal drops", pkts: []testPacket{{payload: 60_000, mss: 400}, {payload: 50}}, fail: func(seq uint64) bool { return seq%7 == 3 }},
 		{name: "engine frames", pkts: []testPacket{{payload: 4000, mss: 1000}}, keep: 3},
+		{name: "all refused", pkts: flows, segs: none},
+		// The route of the flows 2 and 3 goes away between two TCP packets.
+		{name: "no route", pkts: flows, segs: func(h []byte, _, _, _ int) bool { p := srcPort(h); return p != 1002 && p != 1003 },
+			drop: func(v []byte) bool { p := srcPort(v); return p == 1002 || p == 1003 }},
+		// The SA of flow 1 goes away after 70 packets of its TCP packet, in its second set.
+		{name: "no SA in a run", pkts: flows, segs: func(h []byte, _, _, _ int) bool { return srcPort(h) != 1001 },
+			drop: func(v []byte) bool { return srcPort(v) == 1001 && tcpSeq(v) >= 70*400 }},
 	}
 	for _, tc := range cases {
 		for _, workers := range []int{noPipe, 1, 2, 4} {
 			t.Run(fmt.Sprintf("%s/workers=%d", tc.name, workers), func(t *testing.T) {
 				engine := func() *seqEngine {
-					e := &seqEngine{drop: tc.drop, fail: tc.fail, shuffle: workers > 0}
+					e := &seqEngine{drop: tc.drop, segs: tc.segs, fail: tc.fail, shuffle: workers > 0}
 					for i := range tc.keep {
 						e.keep = append(e.keep, pattern(100+i))
 					}
@@ -400,9 +460,10 @@ func TestTxPipeBytes(t *testing.T) {
 		{name: "no GSO", pkts: []testPacket{{payload: 1200}, {v6: true, payload: 1201}}},
 		{name: "UDP", pkts: []testPacket{{udp: true, payload: 1200}, {udp: true, payload: 33}}},
 		{name: "many sets", pkts: []testPacket{{payload: 60_000, mss: 400}, {udp: true, payload: 100}, {v6: true, payload: 60_001, mss: 401}, {payload: 70}, {v6: true, payload: 30_000, mss: 1208}}},
+		{name: "flat packets", pkts: []testPacket{{payload: 4500, mss: 1000, flat: true}, {v6: true, payload: 60_001, mss: 401, flat: true}, {payload: 2501, mss: 999}}},
 	}
 	for _, tc := range cases {
-		for _, workers := range []int{noPipe, 1, 4} {
+		for _, workers := range []int{noPipe, 1, 2, 4} {
 			t.Run(fmt.Sprintf("%s/workers=%d", tc.name, workers), func(t *testing.T) {
 				want := wantPackets(t, tc.pkts)
 				eng := newPSPEngine(t)
@@ -423,70 +484,151 @@ func TestTxPipeBytes(t *testing.T) {
 	}
 }
 
-// TestTxPipePrepare checks the packets that Prepare gets. Prepare can keep a
-// packet that it drops. Thus a packet with an incomplete TCP checksum must
-// come after a packet of the same GSO packet that Prepare took.
+// TestTxPipePrepare checks the calls of the engine. PrepareSegs gets each TCP
+// packet with GSO once. Prepare gets the other packets, and each one is whole.
 func TestTxPipePrepare(t *testing.T) {
-	sport := func(v []byte) uint16 {
-		if v[0]>>4 == header.IPv6Version {
-			return binary.BigEndian.Uint16(v[header.IPv6MinimumSize:])
-		}
-		return binary.BigEndian.Uint16(v[header.IPv4MinimumSize:])
-	}
-	pkts := []testPacket{{payload: 9000, mss: 1000}, {v6: true, payload: 9000, mss: 1000}, {payload: 500}, {v6: true, payload: 9500, mss: 1000}, {payload: 700, mss: 1000}}
+	pkts := []testPacket{{payload: 9000, mss: 1000}, {v6: true, payload: 9000, mss: 1000}, {payload: 500}, {payload: 9500, mss: 1000}, {payload: 700, mss: 1000}}
 	cases := []struct {
-		name string
-		drop func(v []byte, n int) bool // n is the number of Prepare calls before this one.
+		name   string
+		refuse func(sport uint16) bool    // PrepareSegs refuses these flows.
+		drop   func(v []byte, n int) bool // n is the number of Prepare calls before this one.
+		segs   int                        // TCP packets that PrepareSegs takes.
+		calls  int                        // Prepare calls with a pipe.
 	}{
-		{name: "no drops", drop: func([]byte, int) bool { return false }},
-		{name: "one flow has no route", drop: func(v []byte, _ int) bool { return sport(v) == 1001 }},
-		{name: "each fifth packet", drop: func(_ []byte, n int) bool { return n%5 == 2 }},
+		{name: "no drops", segs: 4, calls: 1},
+		{name: "one flow has no route", refuse: func(p uint16) bool { return p == 1001 }, drop: func(v []byte, _ int) bool { return srcPort(v) == 1001 }, segs: 3, calls: 10},
+		{name: "no SA in a run", refuse: func(p uint16) bool { return p == 1003 }, drop: func(v []byte, _ int) bool { return srcPort(v) == 1003 && tcpSeq(v) >= 4000 }, segs: 3, calls: 11},
+		{name: "each fifth packet", refuse: func(uint16) bool { return true }, drop: func(_ []byte, n int) bool { return n%5 == 2 }, calls: 30},
 	}
-	type call struct {
-		sport       uint16
-		whole, took bool
-	}
+	type call struct{ whole, took bool }
 	for _, tc := range cases {
 		for _, workers := range []int{noPipe, 1, 4} {
 			t.Run(fmt.Sprintf("%s/workers=%d", tc.name, workers), func(t *testing.T) {
 				var calls []call
-				eng := &seqEngine{drop: func(v []byte) bool {
-					c := call{sport: sport(v), whole: tcpSumValid(v), took: !tc.drop(v, len(calls))}
-					calls = append(calls, c)
-					return !c.took
-				}}
+				segs, took := 0, 0
+				eng := &seqEngine{
+					drop: func(v []byte) bool {
+						c := call{whole: tcpSumValid(v), took: tc.drop == nil || !tc.drop(v, len(calls))}
+						calls = append(calls, c)
+						if c.took {
+							took++
+						}
+						return !c.took
+					},
+					segs: func(hdr []byte, n, size, total int) bool {
+						p := pkts[srcPort(hdr)-1000]
+						hdrLen := header.IPv4MinimumSize + header.TCPMinimumSize + tcpOpts
+						if p.v6 {
+							hdrLen += header.IPv6MinimumSize - header.IPv4MinimumSize
+						}
+						assert.Len(t, hdr, hdrLen)
+						assert.Equal(t, (p.payload+p.mss-1)/p.mss, n)
+						assert.Equal(t, hdrLen+min(p.mss, p.payload), size)
+						assert.Equal(t, n*hdrLen+p.payload, total)
+						if tc.refuse != nil && tc.refuse(srcPort(hdr)) {
+							return false
+						}
+						segs++
+						took += n
+						return true
+					},
+				}
 				u := newSyncUnderlay()
 				d := newPipeDatapath(t, eng, u, workers)
 				stop := run(t, d, u)
 				writeTestPackets(t, d.ep, pkts)
-				// The last packet has one Prepare call, and no test case drops it.
+				// No test case drops the last packet.
 				require.Eventually(t, func() bool {
 					u.mu.Lock()
 					defer u.mu.Unlock()
-					return len(u.frames) > 0 && sport(u.frames[len(u.frames)-1][seqLen:]) == 1004
+					return len(u.frames) > 0 && srcPort(u.frames[len(u.frames)-1][seqLen:]) == 1004
 				}, 10*time.Second, time.Millisecond)
 				stop()
-				late, took := 0, 0
-				for i, c := range calls {
-					if c.took {
-						took++
-					}
-					if c.whole {
-						continue
-					}
-					late++
-					if assert.Positive(t, i) {
-						assert.True(t, calls[i-1].took && calls[i-1].sport == c.sport, "Prepare call %d", i)
-					}
-				}
 				if workers == noPipe {
-					assert.Zero(t, late)
+					assert.Zero(t, segs)
+					assert.Len(t, calls, 30)
 				} else {
-					assert.Positive(t, late)
+					assert.Equal(t, tc.segs, segs)
+					assert.Len(t, calls, tc.calls)
+				}
+				for i, c := range calls {
+					assert.True(t, c.whole, "Prepare call %d", i)
 				}
 				require.Equal(t, took, u.count())
 				for i, f := range u.frames {
 					assert.True(t, tcpSumValid(f[seqLen:]), "frame %d", i)
+				}
+			})
+		}
+	}
+}
+
+// TestTxPipeTooLarge sends a TCP packet whose packets are larger than the MTU
+// of the endpoint. The pipe drops them and does not call the engine.
+func TestTxPipeTooLarge(t *testing.T) {
+	for _, flat := range []bool{false, true} {
+		t.Run(fmt.Sprintf("flat=%t", flat), func(t *testing.T) {
+			calls := 0
+			eng := &seqEngine{
+				drop: func(v []byte) bool { calls++; return false },
+				segs: func([]byte, int, int, int) bool { calls++; return true },
+			}
+			u := newSyncUnderlay()
+			d := newPipeDatapath(t, eng, u, 2)
+			stop := run(t, d, u)
+			writeTestPackets(t, d.ep, []testPacket{{payload: 2 * testMTU, mss: testMTU, flat: flat}, {payload: 300, mss: 100, flat: flat}})
+			require.Eventually(t, func() bool { return u.count() >= 3 }, 10*time.Second, time.Millisecond)
+			stop()
+			assert.Equal(t, 3, u.count())
+			// One PrepareSegs call, or one Prepare call for each small packet.
+			assert.Equal(t, map[bool]int{false: 1, true: 3}[flat], calls)
+			for _, f := range u.frames {
+				assert.Equal(t, uint16(1001), srcPort(f[seqLen:]))
+			}
+		})
+	}
+}
+
+// TestTxPipeRelease checks that the pipe releases each packet of the endpoint
+// that it took, when it sends the frames and when the datapath closes first.
+func TestTxPipeRelease(t *testing.T) {
+	pkts := []testPacket{{payload: 60_000, mss: 400}, {v6: true, payload: 9000, mss: 1000}, {payload: 500}, {mss: 1000}, {payload: 60_000, mss: 400}, {payload: 60_000, mss: 400, flat: true}}
+	for _, closed := range []bool{false, true} {
+		for _, workers := range []int{1, 4} {
+			t.Run(fmt.Sprintf("closed=%t/workers=%d", closed, workers), func(t *testing.T) {
+				eng := &seqEngine{}
+				if closed {
+					eng.hold = make(chan struct{})
+				}
+				u := newSyncUnderlay()
+				d := newPipeDatapath(t, eng, u, workers)
+				stop := run(t, d, u)
+				// The test keeps one reference to each packet.
+				bufs := make([]*stack.PacketBuffer, 0, 3*len(pkts))
+				for range 3 {
+					for i, p := range pkts {
+						pkb := p.buffer(t, i)
+						bufs = append(bufs, pkb.IncRef())
+						var list stack.PacketBufferList
+						list.PushBack(pkb)
+						writePackets(t, d.ep, &list)
+					}
+				}
+				if closed {
+					require.Eventually(t, func() bool { return eng.holding.Load() > 0 }, 10*time.Second, time.Millisecond)
+					require.NoError(t, d.Close())
+					close(eng.hold)
+				} else {
+					require.Eventually(t, func() bool { return u.count() >= 3*(150+9+1+1+150+150) }, 10*time.Second, time.Millisecond)
+				}
+				stop()
+				// The packets that the pump did not read are in the endpoint.
+				for pkb := d.ep.Read(); pkb != nil; pkb = d.ep.Read() {
+					pkb.DecRef()
+				}
+				for i, pkb := range bufs {
+					assert.Equal(t, int64(1), pkb.ReadRefs(), "packet %d", i)
+					pkb.DecRef()
 				}
 			})
 		}
@@ -605,38 +747,64 @@ func TestTxPipeClose(t *testing.T) {
 	}
 }
 
+// refuseEngine is a pspEngine whose PrepareSegs refuses all TCP packets, so
+// that the pump cuts them.
+type refuseEngine struct{ *pspEngine }
+
+func (refuseEngine) PrepareSegs([]byte, int, int, int, *TxFrame) bool { return false }
+
 // TestTxPipeNoAllocs runs the steps of the send path of a pipe one after the
-// other: the pump, a seal worker and the sender. They must not allocate.
+// other: the pump, a seal worker and the sender. They must not allocate, when
+// a seal worker cuts the TCP packet and when the pump cuts it.
 func TestTxPipeNoAllocs(t *testing.T) {
 	pkts, mss, size := benchPackets(true)
 	plain, _, _ := benchPackets(false)
-	d := newPipeDatapath(t, newPSPEngine(t), nopUnderlay{}, 1)
-	p := d.pipe
-	opts := stack.GSO{Type: stack.GSOTCPv6, NeedsCsum: true, MSS: uint16(mss), L3HdrLen: header.IPv6MinimumSize}
-	buf := make([]byte, 0, 1<<16)
-	if a := testing.AllocsPerRun(100, func() {
-		buf = append(buf[:0], pkts[0]...)
-		err := d.addPacket(buf, opts, header.IPv6MinimumSize)
-		if err == nil {
-			err = d.addPacket(plain[0], stack.GSO{}, header.IPv6MinimumSize)
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		p.flush()
-		s := <-p.work
-		p.sealSet(s)
-		if len(s.frames) != size/mss+1 {
-			t.Fatalf("%d frames, want %d", len(s.frames), size/mss+1)
-		}
-		if err := d.write(s.frames); err != nil {
-			t.Fatal(err)
-		}
-		<-p.full
-		s.frames, s.n = s.frames[:0], 0
-		p.free <- s
-	}); a != 0 {
-		t.Fatalf("send path: %v allocs per run, want 0", a)
+	for _, tc := range []struct {
+		name string
+		eng  func(*pspEngine) Sealer
+		runs int
+	}{
+		{"seal worker cuts", func(e *pspEngine) Sealer { return e }, 1},
+		{"pump cuts", func(e *pspEngine) Sealer { return refuseEngine{e} }, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newPipeDatapath(t, tc.eng(newPSPEngine(t)), nopUnderlay{}, 1)
+			p := d.pipe
+			c := &segCut{p: p}
+			// The pipe takes its own references, so the test sends the packets
+			// again. A race build allocates for some views, so the data is one.
+			gso := stackPacket(pkts[0], header.IPv6MinimumSize, mss, size)
+			defer gso.DecRef()
+			one := newPacket(plain[0], header.IPv6MinimumSize, 0)
+			defer one.DecRef()
+			if a := testing.AllocsPerRun(100, func() {
+				err := d.addPkt(gso)
+				if err == nil {
+					err = d.addPkt(one)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				s := p.cur
+				if len(s.runs) != tc.runs {
+					t.Fatalf("%d runs, want %d", len(s.runs), tc.runs)
+				}
+				p.flush()
+				<-p.work
+				p.sealSet(s, c)
+				if len(s.frames) != size/mss+1 {
+					t.Fatalf("%d frames, want %d", len(s.frames), size/mss+1)
+				}
+				if err := d.write(s.frames); err != nil {
+					t.Fatal(err)
+				}
+				<-p.full
+				s.reset()
+				p.free <- s
+			}); a != 0 {
+				t.Fatalf("send path: %v allocs per run, want 0", a)
+			}
+		})
 	}
 }
 
@@ -660,55 +828,71 @@ func (u countUnderlay) WriteFrames(frames [][]byte) (int, error) {
 // benchBurst is the number of GSO packets in one write of BenchmarkTxPipe.
 const benchBurst = 8
 
-// BenchmarkPump measures the work of the send pump for each cut packet. It
-// cuts GSO packets into a pipe and takes the sets back with no seal.
+// BenchmarkPump measures the work of the send pump for each cut packet: when
+// the pipe takes the GSO packet whole, and when the pump cuts it. No seal.
 func BenchmarkPump(b *testing.B) {
-	pkts, mss, size := benchPackets(true)
-	d := newPipeDatapath(b, &seqEngine{}, nopUnderlay{}, 1)
-	p := d.pipe
-	opts := stack.GSO{Type: stack.GSOTCPv6, NeedsCsum: true, MSS: uint16(mss), L3HdrLen: header.IPv6MinimumSize}
-	buf := make([]byte, 0, 1<<16)
-	b.SetBytes(int64(size))
-	b.ReportAllocs()
-	for b.Loop() {
-		// The cut writes into the packet, so cut a copy.
-		buf = append(buf[:0], pkts[0]...)
-		if err := d.addPacket(buf, opts, header.IPv6MinimumSize); err != nil {
-			b.Fatal(err)
-		}
-		p.flush()
-		for len(p.full) > 0 {
-			s := <-p.full
-			<-p.work
-			s.n = 0
-			p.free <- s
-		}
-	}
-	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*(size/mss)), "ns/packet")
-}
-
-// BenchmarkSealSet measures the work of a seal worker for each packet of a
-// set, with and without the TCP checksum.
-func BenchmarkSealSet(b *testing.B) {
-	for _, sum := range []bool{false, true} {
-		b.Run(fmt.Sprintf("sum=%t", sum), func(b *testing.B) {
+	for _, cut := range []string{"worker", "pump"} {
+		b.Run("cut="+cut, func(b *testing.B) {
 			pkts, mss, size := benchPackets(true)
-			d := newPipeDatapath(b, newPSPEngine(b), nopUnderlay{}, 1)
-			opts := stack.GSO{Type: stack.GSOTCPv6, NeedsCsum: true, MSS: uint16(mss), L3HdrLen: header.IPv6MinimumSize}
-			require.NoError(b, d.addPacket(bytes.Clone(pkts[0]), opts, header.IPv6MinimumSize))
-			s := d.pipe.cur
-			for i := range s.slots[:s.n] {
-				s.slots[i].csum = 0
-				if sum {
-					s.slots[i].csum = header.IPv6MinimumSize
-				}
+			eng := &seqEngine{}
+			if cut == "pump" {
+				eng.segs = func([]byte, int, int, int) bool { return false }
 			}
+			d := newPipeDatapath(b, eng, nopUnderlay{}, 1)
+			p := d.pipe
+			pkt := stackPacket(pkts[0], header.IPv6MinimumSize, mss, 1)
+			defer pkt.DecRef()
 			b.SetBytes(int64(size))
 			b.ReportAllocs()
 			for b.Loop() {
-				d.pipe.sealSet(s)
+				if err := d.addPkt(pkt); err != nil {
+					b.Fatal(err)
+				}
+				p.flush()
+				for len(p.full) > 0 {
+					s := <-p.full
+					<-p.work
+					s.drop()
+					p.free <- s
+				}
 			}
-			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*s.n), "ns/packet")
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*(size/mss)), "ns/packet")
+		})
+	}
+}
+
+// BenchmarkSealSet measures the work of a seal worker for each packet of a
+// set: when it cuts the packets of a GSO packet, and when the pump cut them.
+func BenchmarkSealSet(b *testing.B) {
+	for _, cut := range []string{"worker", "pump"} {
+		b.Run("cut="+cut, func(b *testing.B) {
+			pkts, mss, size := benchPackets(true)
+			var eng Sealer = newPSPEngine(b)
+			if cut == "pump" {
+				eng = refuseEngine{eng.(*pspEngine)}
+			}
+			d := newPipeDatapath(b, eng, nopUnderlay{}, 1)
+			pkt := stackPacket(pkts[0], header.IPv6MinimumSize, mss, 1)
+			defer pkt.DecRef()
+			require.NoError(b, d.addPkt(pkt))
+			s := d.pipe.cur
+			n := s.n
+			require.Equal(b, size/mss, n)
+			// A cut releases the packet of a run and moves its place. Thus the
+			// set gets the runs again after each seal.
+			runs := append([]txRun(nil), s.runs...)
+			c := &segCut{p: d.pipe}
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			for b.Loop() {
+				d.pipe.sealSet(s, c)
+				for i := range runs {
+					pkt.IncRef()
+					s.runs[i] = runs[i]
+				}
+			}
+			s.drop()
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/packet")
 		})
 	}
 }
@@ -748,7 +932,7 @@ func benchTxPipe(b *testing.B, eng Sealer, workers int) {
 	for b.Loop() {
 		for range benchBurst {
 			for _, p := range pkts {
-				list.PushBack(newPacket(p, header.IPv6MinimumSize, mss))
+				list.PushBack(stackPacket(p, header.IPv6MinimumSize, mss, 1))
 			}
 		}
 		writePackets(b, d.ep, &list)

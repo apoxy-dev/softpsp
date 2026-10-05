@@ -68,7 +68,17 @@ func (s *TxSA) Reserve() (uint64, error) {
 	return seq, nil
 }
 
-// SealSeq is Seal with the sequence number seq from Reserve.
+// ReserveN takes the next n sequence numbers for SealSeq and returns the
+// first one. It returns ErrLimit when the SA has fewer than n left.
+func (s *TxSA) ReserveN(n int) (uint64, error) {
+	seq := s.next.Add(uint64(n)) - uint64(n)
+	if seq+uint64(n) > uint64(s.limit) {
+		return 0, ErrLimit
+	}
+	return seq, nil
+}
+
+// SealSeq is Seal with the sequence number seq from Reserve or ReserveN.
 func (s *TxSA) SealSeq(seq uint64, dst, inner []byte) (int, error) {
 	h := psp.Header{Version: s.version, SPI: s.spi, IV: seq, VNI: s.vni, Flags: psp.FlagSeq, Seq: uint32(seq)}
 	return psp.Seal(s.aead, h, dst, inner)

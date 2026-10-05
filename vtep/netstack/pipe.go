@@ -9,6 +9,8 @@ import (
 
 	"github.com/apoxy-dev/softpsp/engine"
 	"github.com/apoxy-dev/softpsp/vtep"
+	"golang.org/x/sys/cpu"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 const (
@@ -18,7 +20,7 @@ const (
 	// txSlots is the most frames in one set, and so in one underlay write.
 	txSlots = maxBatchSize
 	// maxSealWorkers is the most seal workers of a send pipe. A worker also
-	// completes the TCP checksums, and 4 workers keep up with one send pump.
+	// cuts the TCP packets and completes the TCP checksums.
 	maxSealWorkers = 4
 )
 
@@ -30,9 +32,12 @@ type Sealer interface {
 	Overhead() int
 	// Prepare starts the frame of the inner packet virt: it picks the SA and
 	// reserves the sequence number. It runs on the send pump, in send order.
-	// It returns false to drop the packet. After a packet that Prepare took,
-	// the TCP checksum of virt can be incomplete.
+	// It returns false to drop the packet.
 	Prepare(virt []byte, f *TxFrame) bool
+	// PrepareSegs is Prepare for the n packets of one TCP packet with the
+	// headers hdr: size is the largest one, total is all bytes, and packet i
+	// gets f.Seq+i. On false it did nothing: the pump prepares each packet.
+	PrepareSegs(hdr []byte, n, size, total int, f *TxFrame) bool
 	// Seal writes the frame of virt, from Prepare, to phy and returns its
 	// length, or 0 to drop the packet. It can change virt. Many goroutines
 	// can run it at once.
@@ -61,27 +66,36 @@ func sealWorkers(procs int) int {
 }
 
 // txPipe moves the frames of the send pump to seal workers and then to one
-// sender, in send order. The pump copies each inner packet into a slot of a
-// set and prepares its frame. A seal worker completes the TCP checksums of
-// the set, seals it and gives a token. The sender takes the sets in order,
-// waits for the token and writes the frames to the underlay.
+// sender, in send order. The pump gives each TCP packet of the endpoint to a
+// set as a run, and copies each other packet into a slot. A seal worker cuts
+// the runs, seals the set and gives a token. The sender takes the sets in
+// order, waits for the token and writes the frames to the underlay.
 type txPipe struct {
 	d       *Datapath
 	eng     Sealer
 	mtu     int
 	workers int
-	cur     *txSet      // The set that the pump fills. Nil until it adds a frame.
 	work    chan *txSet // Sets for the seal workers.
 	full    chan *txSet // Sets for the sender, in send order.
 	free    chan *txSet // Empty sets for the pump.
 
+	// The pump writes the fields below. The pads keep them off the cache
+	// lines that the seal workers and the sender read.
+	_       cpu.CacheLinePad
+	cur     *txSet     // The set that the pump fills. Nil until it adds a frame.
+	f       TxFrame    // The frame of PrepareSegs. A local would be on the heap.
 	mu      sync.Mutex // Guards closing and the sends of flush.
 	closing bool       // Set when the sender stops. Then flush drops the sets.
+	_       cpu.CacheLinePad
 }
 
+// txSet is the frames of one underlay write. One goroutine owns it at a time:
+// the pump, then a seal worker, then the sender.
 type txSet struct {
+	_      cpu.CacheLinePad // Two sets do not have a cache line in common.
 	slots  []txSlot
-	n      int
+	n      int           // Slots in use.
+	runs   []txRun       // The TCP packets that a seal worker cuts, in slot order.
 	frames [][]byte      // The frames of the set, in order. The sealer fills it.
 	sealed chan struct{} // Gets one token when a seal worker finished the set.
 }
@@ -91,9 +105,30 @@ type txSlot struct {
 	virt []byte // The inner packet.
 	phy  []byte // The frame.
 	n    int    // The length of the inner packet, or of the frame when seal is false.
-	csum int    // Above 0, the worker completes the TCP checksum after csum bytes of IP headers.
 	seal bool   // False for a frame of ToPhy, which is complete.
 	f    TxFrame
+}
+
+// txRun is the packets of one TCP packet of the endpoint that are in one set.
+// The pump does not copy them: a seal worker cuts them from pkt into slots.
+type txRun struct {
+	pkt  *stack.PacketBuffer // The run owns one reference.
+	segs tcpSegs             // The cut, at the first packet of the run.
+	slot int                 // The first slot.
+	n    int                 // The number of packets, one slot for each.
+	f    TxFrame             // The frame of the first packet.
+}
+
+// reset empties s after a seal worker cut its runs.
+func (s *txSet) reset() { s.runs, s.frames, s.n = s.runs[:0], s.frames[:0], 0 }
+
+// drop empties s with no seal. It releases the packets of the runs.
+func (s *txSet) drop() {
+	for i := range s.runs {
+		s.runs[i].pkt.DecRef()
+		s.runs[i].pkt = nil
+	}
+	s.reset()
 }
 
 // newTxPipe makes a pipe with workers seal workers, at least one.
@@ -103,8 +138,11 @@ func newTxPipe(d *Datapath, eng Sealer, workers int) *txPipe {
 	p := &txPipe{d: d, eng: eng, mtu: mtu, workers: workers, work: make(chan *txSet, sets), full: make(chan *txSet, sets), free: make(chan *txSet, sets)}
 	size := mtu + eng.Overhead()
 	slab := make([]byte, sets*txSlots*(mtu+size))
-	for range sets {
-		s := &txSet{slots: make([]txSlot, txSlots), frames: make([][]byte, 0, txSlots), sealed: make(chan struct{}, 1)}
+	all := make([]txSet, sets)
+	for i := range all {
+		s := &all[i]
+		s.slots, s.runs = make([]txSlot, txSlots), make([]txRun, 0, txSlots)
+		s.frames, s.sealed = make([][]byte, 0, txSlots), make(chan struct{}, 1)
 		for i := range s.slots {
 			s.slots[i].virt, slab = slab[:mtu:mtu], slab[mtu:]
 			s.slots[i].phy, slab = slab[:size:size], slab[size:]
@@ -114,10 +152,10 @@ func newTxPipe(d *Datapath, eng Sealer, workers int) *txPipe {
 	return p
 }
 
-// slot returns the next free slot of the current set. It waits for a free set
+// set returns the current set, which has a free slot. It waits for a free set
 // when the current one is full, and returns net.ErrClosed when the datapath
 // closes.
-func (p *txPipe) slot() (*txSlot, error) {
+func (p *txPipe) set() (*txSet, error) {
 	s := p.cur
 	if s != nil && s.n == txSlots {
 		p.flush()
@@ -131,28 +169,55 @@ func (p *txPipe) slot() (*txSlot, error) {
 		}
 		p.cur = s
 	}
-	return &s.slots[s.n], nil
+	return s, nil
 }
 
 // add prepares the frame of the inner packet virt and copies virt into the
-// current set. With csum above 0, a seal worker completes the TCP checksum of
-// virt. It returns false when it dropped the packet.
-func (p *txPipe) add(virt []byte, csum int) (bool, error) {
+// current set.
+func (p *txPipe) add(virt []byte) error {
 	if len(virt) > p.mtu {
 		// The endpoint sends no packet above its MTU.
-		return false, nil
+		return nil
 	}
-	sl, err := p.slot()
+	s, err := p.set()
 	if err != nil {
-		return false, err
+		return err
 	}
+	sl := &s.slots[s.n]
 	if !p.eng.Prepare(virt, &sl.f) {
-		return false, nil
+		return nil
 	}
 	sl.n = copy(sl.virt, virt)
-	sl.csum = csum
 	sl.seal = true
-	p.cur.n++
+	s.n++
+	return nil
+}
+
+// addSegs prepares the frames of the TCP packet pkt in one call and gives pkt
+// to the sets as runs, with no copy. On false, the pump must cut pkt.
+func (p *txPipe) addSegs(pkt *stack.PacketBuffer, hdr []byte, segs *tcpSegs) (bool, error) {
+	size := segs.hdrLen + segs.length()
+	if size > p.mtu {
+		return false, nil
+	}
+	n := segs.count()
+	if !p.eng.PrepareSegs(hdr, n, size, segs.size+(n-1)*segs.hdrLen, &p.f) {
+		return false, nil
+	}
+	for i := 0; i < n; {
+		s, err := p.set()
+		if err != nil {
+			return true, err
+		}
+		k := min(n-i, txSlots-s.n)
+		s.runs = s.runs[:len(s.runs)+1]
+		r := &s.runs[len(s.runs)-1]
+		r.pkt, r.segs, r.slot, r.n, r.f = pkt.IncRef(), *segs, s.n, k, p.f
+		r.segs.seek(i)
+		r.f.Seq += uint64(i)
+		s.n += k
+		i += k
+	}
 	return true, nil
 }
 
@@ -160,16 +225,17 @@ func (p *txPipe) add(virt []byte, csum int) (bool, error) {
 // current set.
 func (p *txPipe) toPhy() error {
 	for {
-		sl, err := p.slot()
+		s, err := p.set()
 		if err != nil {
 			return err
 		}
+		sl := &s.slots[s.n]
 		n := p.eng.ToPhy(sl.phy)
 		if n == 0 {
 			return nil
 		}
 		sl.n, sl.seal = n, false
-		p.cur.n++
+		s.n++
 	}
 }
 
@@ -183,6 +249,7 @@ func (p *txPipe) flush() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closing {
+		s.drop()
 		return
 	}
 	// The channels hold all sets, so these sends do not wait.
@@ -193,34 +260,105 @@ func (p *txPipe) flush() {
 // seal is a seal worker. It seals the sets of work in order and gives a token
 // for each one, until the sender closes work.
 func (p *txPipe) seal() error {
+	c := &segCut{p: p}
 	for s := range p.work {
 		if p.stopped() {
-			s.frames = s.frames[:0]
+			s.drop()
 		} else {
-			p.sealSet(s)
+			p.sealSet(s, c)
 		}
 		s.sealed <- struct{}{}
 	}
 	return nil
 }
 
-// sealSet completes the TCP checksums of s and seals its frames.
-func (p *txPipe) sealSet(s *txSet) {
+// sealSet cuts the runs of s with c and seals the frames of s, in slot order.
+func (p *txPipe) sealSet(s *txSet, c *segCut) {
 	s.frames = s.frames[:0]
-	for i := range s.slots[:s.n] {
+	runs := s.runs
+	for i := 0; i < s.n; {
+		if len(runs) > 0 && runs[0].slot == i {
+			c.cut(s, &runs[0])
+			i += runs[0].n
+			runs = runs[1:]
+			continue
+		}
 		sl := &s.slots[i]
 		n := sl.n
 		if sl.seal {
-			virt := sl.virt[:sl.n]
-			if sl.csum > 0 {
-				tcpChecksum(virt, sl.csum)
-			}
-			n = p.eng.Seal(&sl.f, virt, sl.phy)
+			n = p.eng.Seal(&sl.f, sl.virt[:sl.n], sl.phy)
 		}
 		if n > 0 {
 			s.frames = append(s.frames, sl.phy[:n])
 		}
+		i++
 	}
+}
+
+// segCut cuts the packets of a run into their slots and seals them. It is the
+// writer that gets the payload of the TCP packet. Each seal worker has one.
+type segCut struct {
+	p    *txPipe
+	s    *txSet
+	segs *tcpSegs
+	f    TxFrame // The frame of the next packet.
+	slot int     // The slot of the next packet.
+	end  int     // The slot after the last packet of the run.
+	skip int     // Payload bytes before the next packet.
+	n    int     // The payload length of the next packet.
+	fill int     // The payload bytes of the next packet that are in its slot.
+}
+
+// cut cuts and seals the packets of the run r of s, and releases its packet.
+func (c *segCut) cut(s *txSet, r *txRun) {
+	c.s, c.segs, c.f = s, &r.segs, r.f
+	c.slot, c.end = r.slot, r.slot+r.n
+	c.skip = r.segs.off - r.segs.hdrLen
+	c.n, c.fill = r.segs.length(), 0
+	if c.n == 0 {
+		// A packet with no payload gets no Write.
+		c.seal()
+	} else {
+		_, _ = r.pkt.Data().ReadTo(c, true)
+	}
+	r.pkt.DecRef()
+	r.pkt = nil
+}
+
+// Write copies the payload b into the slots of the run. It seals each packet
+// that has all its payload.
+func (c *segCut) Write(b []byte) (int, error) {
+	n := len(b)
+	if c.skip > 0 {
+		k := min(c.skip, len(b))
+		c.skip -= k
+		b = b[k:]
+	}
+	for len(b) > 0 && c.slot < c.end {
+		off := c.segs.hdrLen + c.fill
+		k := copy(c.s.slots[c.slot].virt[off:off+c.n-c.fill], b)
+		b = b[k:]
+		c.fill += k
+		if c.fill == c.n {
+			c.seal()
+		}
+	}
+	return n, nil
+}
+
+// seal writes the headers of the next packet before its payload, completes
+// its TCP checksum and seals it.
+func (c *segCut) seal() {
+	sl := &c.s.slots[c.slot]
+	virt := sl.virt[:c.segs.hdrLen+c.n]
+	c.segs.header(virt)
+	tcpChecksum(virt, c.segs.ipLen)
+	if n := c.p.eng.Seal(&c.f, virt, sl.phy); n > 0 {
+		c.s.frames = append(c.s.frames, sl.phy[:n])
+	}
+	c.f.Seq++
+	c.slot++
+	c.n, c.fill = c.segs.length(), 0
 }
 
 // run is the sender. It writes the sets to the underlay in send order until
@@ -234,8 +372,7 @@ func (p *txPipe) run() error {
 				return net.ErrClosed
 			}
 			err := p.d.write(s.frames)
-			s.frames = s.frames[:0]
-			s.n = 0
+			s.reset()
 			p.free <- s
 			if err != nil {
 				p.stop()

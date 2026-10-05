@@ -125,6 +125,50 @@ func TestTxSAReserve(t *testing.T) {
 	}
 }
 
+// TestTxSAReserveN reserves sequence numbers in groups, with single ones
+// between them. A group that does not fit below the limit gets none.
+func TestTxSAReserveN(t *testing.T) {
+	tab := newTable(t, 4)
+	tx := addTx(t, tab, testSA())
+	want := uint64(0)
+	for _, n := range []int{1, 44, 3, 64} {
+		seq, err := tx.ReserveN(n)
+		if err != nil || seq != want {
+			t.Fatalf("ReserveN(%d): %d, %v, want %d", n, seq, err, want)
+		}
+		want += uint64(n)
+		if seq, err := tx.Reserve(); err != nil || seq != want {
+			t.Fatalf("Reserve after ReserveN(%d): %d, %v, want %d", n, seq, err, want)
+		}
+		want++
+	}
+	inner := ipPacket(src4, 100)
+	pkt := make([]byte, len(inner)+psp.Overhead)
+	// The receiver accepts all the numbers in order.
+	for seq := range want {
+		if _, err := tx.SealSeq(seq, pkt, inner); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := tab.Queue(0).Receive(pkt); err != nil {
+			t.Fatalf("Receive %d: %v", seq, err)
+		}
+	}
+	limit := uint64(tx.limit)
+	tx.next.Store(limit - 4)
+	if seq, err := tx.ReserveN(4); err != nil || seq != limit-4 {
+		t.Fatalf("the last 4 numbers: %d, %v", seq, err)
+	}
+	tx.next.Store(limit - 4)
+	for range 2 {
+		if _, err := tx.ReserveN(5); !errors.Is(err, ErrLimit) {
+			t.Fatalf("ReserveN past the limit: got %v, want %v", err, ErrLimit)
+		}
+	}
+	if _, err := tx.Reserve(); !errors.Is(err, ErrLimit) {
+		t.Fatalf("Reserve after a failed ReserveN: got %v, want %v", err, ErrLimit)
+	}
+}
+
 func TestNewTxSA(t *testing.T) {
 	key := make([]byte, 16)
 	cases := []struct {

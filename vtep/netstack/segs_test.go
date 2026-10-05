@@ -96,8 +96,8 @@ func pattern(n int) []byte {
 	return b
 }
 
-// TestTCPSegs cuts GSO packets into packets of the MSS and checks each one.
-// Each packet must also equal a packet that tcpPacket makes whole.
+// TestTCPSegs cuts GSO packets into packets of the MSS and checks each one
+// against a whole packet of tcpPacket, also with the cut of a seal worker.
 func TestTCPSegs(t *testing.T) {
 	v4a, v4b := netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2")
 	v6a, v6b := netip.MustParseAddr("fd00::1"), netip.MustParseAddr("fd00::2")
@@ -140,14 +140,28 @@ func TestTCPSegs(t *testing.T) {
 			}
 
 			var s tcpSegs
-			require.True(t, s.init(pkt, ipLen, tc.mss))
+			require.True(t, s.init(pkt, ipLen, len(pkt), tc.mss))
+			require.Equal(t, tc.want, s.count())
 			var got [][]byte
-			for seg := s.next(); seg != nil; seg = s.next() {
+			for seg := s.next(pkt); seg != nil; seg = s.next(pkt) {
 				tcpChecksum(seg, ipLen)
 				// The next packet writes over this one.
 				got = append(got, bytes.Clone(seg))
 			}
 			require.Len(t, got, tc.want)
+
+			// Cut the packets one by one, last first, from the headers alone.
+			var one tcpSegs
+			require.True(t, one.init(orig[:hdrLen], ipLen, len(orig), tc.mss))
+			for i := tc.want - 1; i >= 0; i-- {
+				one.seek(i)
+				off := hdrLen + i*mss
+				seg := make([]byte, hdrLen+one.length())
+				copy(seg[hdrLen:], orig[off:])
+				one.header(seg)
+				tcpChecksum(seg, ipLen)
+				assert.Equal(t, got[i], seg, "packet %d from the headers", i)
+			}
 
 			srcA, dstA := tcpip.AddrFromSlice(tc.src.AsSlice()), tcpip.AddrFromSlice(tc.dst.AsSlice())
 			var joined []byte
@@ -224,7 +238,7 @@ func TestTCPSegsBad(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var s tcpSegs
-			assert.False(t, s.init(tc.pkt, tc.ipLen, 50))
+			assert.False(t, s.init(tc.pkt, tc.ipLen, len(tc.pkt), 50))
 		})
 	}
 }
@@ -258,12 +272,12 @@ func TestSplitJoin(t *testing.T) {
 			payload := pattern(segs * mss)
 			pkt := tcpPacket(pair[0], pair[1], 1000, 5, 7, flags, payload, true)
 			var s tcpSegs
-			require.True(t, s.init(pkt, ipLen, mss))
+			require.True(t, s.init(pkt, ipLen, len(pkt), mss))
 
 			r := &groRecorder{}
 			g := &gro.GRO{Dispatcher: r}
 			g.Init(true)
-			for seg := s.next(); seg != nil; seg = s.next() {
+			for seg := s.next(pkt); seg != nil; seg = s.next(pkt) {
 				tcpChecksum(seg, ipLen)
 				pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(seg)})
 				pkb.NetworkProtocolNumber = proto
@@ -303,8 +317,8 @@ func BenchmarkTCPSegs(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				copy(pkt, hdr)
-				s.init(pkt, ipLen, bc.mss)
-				for seg := s.next(); seg != nil; seg = s.next() {
+				s.init(pkt, ipLen, len(pkt), bc.mss)
+				for seg := s.next(pkt); seg != nil; seg = s.next(pkt) {
 					if bc.sum {
 						tcpChecksum(seg, ipLen)
 					}
