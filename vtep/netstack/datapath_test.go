@@ -384,7 +384,7 @@ func TestDatapath_RunTwiceRejected(t *testing.T) {
 }
 
 // buildUDPv4 hand-builds an IPv4/UDP packet with valid checksums.
-func buildUDPv4(t *testing.T, src, dst tcpip.Address, srcPort, dstPort uint16, payload []byte) []byte {
+func buildUDPv4(t testing.TB, src, dst tcpip.Address, srcPort, dstPort uint16, payload []byte) []byte {
 	t.Helper()
 	const ipHdrLen = header.IPv4MinimumSize
 	udpLen := header.UDPMinimumSize + len(payload)

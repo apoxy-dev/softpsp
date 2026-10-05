@@ -25,6 +25,7 @@ type tcpSegs struct {
 	i      int // Index of the next packet.
 	seq    uint32
 	id     uint16
+	ipSum  uint16 // IPv4 header checksum without the length and the ID.
 	pseudo uint16 // Pseudo-header checksum without the length.
 	v4     bool
 }
@@ -60,6 +61,12 @@ func (s *tcpSegs) init(pkt []byte, ipLen, mss int) bool {
 	s.pseudo = checksum.Combine(s.pseudo, uint16(header.TCPProtocolNumber))
 	s.pkt, s.ipLen, s.hdrLen = pkt, ipLen, ipLen+tcpLen
 	copy(s.hdr[:], pkt[:s.hdrLen])
+	if s.v4 {
+		// next sets the length, the ID and the checksum of each packet.
+		clear(s.hdr[2:6])
+		s.hdr[10], s.hdr[11] = 0, 0
+		s.ipSum = checksum.Checksum(s.hdr[:ipLen], 0)
+	}
 	s.seq = binary.BigEndian.Uint32(pkt[ipLen+4:])
 	s.mss = mss
 	if mss <= 0 {
@@ -69,7 +76,8 @@ func (s *tcpSegs) init(pkt []byte, ipLen, mss int) bool {
 	return true
 }
 
-// next returns the next packet, or nil after the last one.
+// next returns the next packet, or nil after the last one. The TCP checksum of
+// the packet has only the pseudo-header sum, and tcpChecksum completes it.
 func (s *tcpSegs) next() []byte {
 	if s.i > 0 && s.off >= len(s.pkt) {
 		return nil
@@ -78,10 +86,11 @@ func (s *tcpSegs) next() []byte {
 	seg := s.pkt[s.off-s.hdrLen : s.off+n]
 	copy(seg, s.hdr[:s.hdrLen])
 	if s.v4 {
+		id := s.id + uint16(s.i)
 		binary.BigEndian.PutUint16(seg[2:], uint16(len(seg)))
-		binary.BigEndian.PutUint16(seg[4:], s.id+uint16(s.i))
-		seg[10], seg[11] = 0, 0
-		binary.BigEndian.PutUint16(seg[10:], ^checksum.Checksum(seg[:s.ipLen], 0))
+		binary.BigEndian.PutUint16(seg[4:], id)
+		sum := checksum.Combine(checksum.Combine(s.ipSum, uint16(len(seg))), id)
+		binary.BigEndian.PutUint16(seg[10:], ^sum)
 	} else {
 		binary.BigEndian.PutUint16(seg[4:], uint16(len(seg)-header.IPv6MinimumSize))
 	}
@@ -93,10 +102,17 @@ func (s *tcpSegs) next() []byte {
 	if s.i > 0 {
 		tcp[13] &^= uint8(header.TCPFlagCwr)
 	}
-	tcp[16], tcp[17] = 0, 0
-	sum := checksum.Checksum(tcp, checksum.Combine(s.pseudo, uint16(len(tcp))))
-	binary.BigEndian.PutUint16(tcp[16:], ^sum)
+	binary.BigEndian.PutUint16(tcp[16:], checksum.Combine(s.pseudo, uint16(len(tcp))))
 	s.off += n
 	s.i++
 	return seg
+}
+
+// tcpChecksum completes the TCP checksum of pkt, a packet of next with ipLen
+// bytes of IP headers.
+func tcpChecksum(pkt []byte, ipLen int) {
+	tcp := pkt[ipLen:]
+	sum := binary.BigEndian.Uint16(tcp[16:])
+	tcp[16], tcp[17] = 0, 0
+	binary.BigEndian.PutUint16(tcp[16:], ^checksum.Checksum(tcp, sum))
 }

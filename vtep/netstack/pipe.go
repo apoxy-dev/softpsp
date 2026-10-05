@@ -17,10 +17,9 @@ const (
 	txSets = 8
 	// txSlots is the most frames in one set, and so in one underlay write.
 	txSlots = maxBatchSize
-	// maxSealWorkers is the most seal workers of a send pipe. One worker seals
-	// tens of Gbps, and more workers only take CPUs from the pump and the
-	// netstack.
-	maxSealWorkers = 2
+	// maxSealWorkers is the most seal workers of a send pipe. A worker also
+	// completes the TCP checksums, and 4 workers keep up with one send pump.
+	maxSealWorkers = 4
 )
 
 // Sealer is an engine that can seal frames on many goroutines at once. The
@@ -31,7 +30,8 @@ type Sealer interface {
 	Overhead() int
 	// Prepare starts the frame of the inner packet virt: it picks the SA and
 	// reserves the sequence number. It runs on the send pump, in send order.
-	// It returns false to drop the packet.
+	// It returns false to drop the packet. After a packet that Prepare took,
+	// the TCP checksum of virt can be incomplete.
 	Prepare(virt []byte, f *TxFrame) bool
 	// Seal writes the frame of virt, from Prepare, to phy and returns its
 	// length, or 0 to drop the packet. It can change virt. Many goroutines
@@ -62,9 +62,9 @@ func sealWorkers(procs int) int {
 
 // txPipe moves the frames of the send pump to seal workers and then to one
 // sender, in send order. The pump copies each inner packet into a slot of a
-// set and prepares its frame. A seal worker seals the set and gives a token.
-// The sender takes the sets in order, waits for the token and writes the
-// frames to the underlay.
+// set and prepares its frame. A seal worker completes the TCP checksums of
+// the set, seals it and gives a token. The sender takes the sets in order,
+// waits for the token and writes the frames to the underlay.
 type txPipe struct {
 	d       *Datapath
 	eng     Sealer
@@ -91,6 +91,7 @@ type txSlot struct {
 	virt []byte // The inner packet.
 	phy  []byte // The frame.
 	n    int    // The length of the inner packet, or of the frame when seal is false.
+	csum int    // Above 0, the worker completes the TCP checksum after csum bytes of IP headers.
 	seal bool   // False for a frame of ToPhy, which is complete.
 	f    TxFrame
 }
@@ -134,23 +135,25 @@ func (p *txPipe) slot() (*txSlot, error) {
 }
 
 // add prepares the frame of the inner packet virt and copies virt into the
-// current set.
-func (p *txPipe) add(virt []byte) error {
+// current set. With csum above 0, a seal worker completes the TCP checksum of
+// virt. It returns false when it dropped the packet.
+func (p *txPipe) add(virt []byte, csum int) (bool, error) {
 	if len(virt) > p.mtu {
 		// The endpoint sends no packet above its MTU.
-		return nil
+		return false, nil
 	}
 	sl, err := p.slot()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !p.eng.Prepare(virt, &sl.f) {
-		return nil
+		return false, nil
 	}
 	sl.n = copy(sl.virt, virt)
+	sl.csum = csum
 	sl.seal = true
 	p.cur.n++
-	return nil
+	return true, nil
 }
 
 // toPhy adds the frames of the engine, for example keep-alives, to the
@@ -201,14 +204,18 @@ func (p *txPipe) seal() error {
 	return nil
 }
 
-// sealSet seals the frames of s.
+// sealSet completes the TCP checksums of s and seals its frames.
 func (p *txPipe) sealSet(s *txSet) {
 	s.frames = s.frames[:0]
 	for i := range s.slots[:s.n] {
 		sl := &s.slots[i]
 		n := sl.n
 		if sl.seal {
-			n = p.eng.Seal(&sl.f, sl.virt[:sl.n], sl.phy)
+			virt := sl.virt[:sl.n]
+			if sl.csum > 0 {
+				tcpChecksum(virt, sl.csum)
+			}
+			n = p.eng.Seal(&sl.f, virt, sl.phy)
 		}
 		if n > 0 {
 			s.frames = append(s.frames, sl.phy[:n])

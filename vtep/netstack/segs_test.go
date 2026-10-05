@@ -74,6 +74,19 @@ func tcpPacket(src, dst netip.Addr, sport uint16, seq, ack uint32, flags header.
 	return b
 }
 
+// wantSeg returns packet i of the cut of a GSO packet of tcpPacket. It is a
+// whole packet of tcpPacket, with checksums over all its bytes.
+func wantSeg(src, dst netip.Addr, sport uint16, seq, ack uint32, flags header.TCPFlags, payload []byte, i int) []byte {
+	p := tcpPacket(src, dst, sport, seq, ack, flags, payload, false)
+	if src.Is4() {
+		ip := header.IPv4(p)
+		ip.SetID(0xfffe + uint16(i))
+		ip.SetChecksum(0)
+		ip.SetChecksum(^ip.CalculateChecksum())
+	}
+	return p
+}
+
 // pattern returns n bytes that differ at each offset.
 func pattern(n int) []byte {
 	b := make([]byte, n)
@@ -84,6 +97,7 @@ func pattern(n int) []byte {
 }
 
 // TestTCPSegs cuts GSO packets into packets of the MSS and checks each one.
+// Each packet must also equal a packet that tcpPacket makes whole.
 func TestTCPSegs(t *testing.T) {
 	v4a, v4b := netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2")
 	v6a, v6b := netip.MustParseAddr("fd00::1"), netip.MustParseAddr("fd00::2")
@@ -103,6 +117,7 @@ func TestTCPSegs(t *testing.T) {
 		{name: "IPv6 most", src: v6a, dst: v6b, payload: 1<<16 - 1 - header.IPv6MinimumSize - 32, mss: 1208, flags: header.TCPFlagAck, want: 55},
 		{name: "IPv4 most", src: v4a, dst: v4b, payload: 1<<16 - 1 - header.IPv4MinimumSize - 32, mss: 1360, flags: header.TCPFlagAck, want: 49},
 		{name: "odd MSS", src: v6a, dst: v6b, payload: 1001, mss: 333, flags: all, want: 4},
+		{name: "IPv4 odd last", src: v4a, dst: v4b, payload: 2501, mss: 1000, flags: header.TCPFlagAck, want: 3},
 		{name: "MSS below header", src: v4a, dst: v4b, payload: 100, mss: 7, flags: all, want: 15},
 		{name: "FIN PSH CWR", src: v4a, dst: v4b, payload: 2500, mss: 1000, flags: all, want: 3},
 		{name: "one packet", src: v6a, dst: v6b, payload: 999, mss: 1000, flags: all, want: 1},
@@ -128,6 +143,7 @@ func TestTCPSegs(t *testing.T) {
 			require.True(t, s.init(pkt, ipLen, tc.mss))
 			var got [][]byte
 			for seg := s.next(); seg != nil; seg = s.next() {
+				tcpChecksum(seg, ipLen)
 				// The next packet writes over this one.
 				got = append(got, bytes.Clone(seg))
 			}
@@ -175,6 +191,7 @@ func TestTCPSegs(t *testing.T) {
 					clear(b[ipLen+16 : ipLen+18])
 				}
 				assert.Equal(t, o, h, msg)
+				assert.Equal(t, wantSeg(tc.src, tc.dst, 1000, uint32(seq+i*mss), 7, want, p, i), seg, msg)
 				joined = append(joined, p...)
 			}
 			assert.True(t, bytes.Equal(payload, joined), "the payloads do not make the original payload")
@@ -247,6 +264,7 @@ func TestSplitJoin(t *testing.T) {
 			g := &gro.GRO{Dispatcher: r}
 			g.Init(true)
 			for seg := s.next(); seg != nil; seg = s.next() {
+				tcpChecksum(seg, ipLen)
 				pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(seg)})
 				pkb.NetworkProtocolNumber = proto
 				g.Enqueue(pkb)
@@ -264,13 +282,14 @@ func TestSplitJoin(t *testing.T) {
 }
 
 // BenchmarkTCPSegs cuts a GSO packet of 64 KiB into packets of the MSS of an
-// inner MTU of 1280 and 1412.
+// inner MTU of 1280 and 1412. With sum, it also completes the TCP checksums.
 func BenchmarkTCPSegs(b *testing.B) {
 	for _, bc := range []struct {
 		v6  bool
 		mss int
-	}{{false, 1228}, {true, 1208}, {true, 1340}} {
-		b.Run(fmt.Sprintf("v6=%t/mss=%d", bc.v6, bc.mss), func(b *testing.B) {
+		sum bool
+	}{{false, 1228, false}, {true, 1208, false}, {true, 1340, false}, {false, 1228, true}, {true, 1208, true}, {true, 1340, true}} {
+		b.Run(fmt.Sprintf("v6=%t/mss=%d/sum=%t", bc.v6, bc.mss, bc.sum), func(b *testing.B) {
 			src, dst := netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2")
 			ipLen := header.IPv4MinimumSize
 			if bc.v6 {
@@ -286,6 +305,9 @@ func BenchmarkTCPSegs(b *testing.B) {
 				copy(pkt, hdr)
 				s.init(pkt, ipLen, bc.mss)
 				for seg := s.next(); seg != nil; seg = s.next() {
+					if bc.sum {
+						tcpChecksum(seg, ipLen)
+					}
 				}
 			}
 		})

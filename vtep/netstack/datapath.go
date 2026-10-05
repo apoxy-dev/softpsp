@@ -278,37 +278,51 @@ func (d *Datapath) sendQueued() error {
 // with GSO becomes one packet for each MSS of payload.
 func (d *Datapath) addPacket(pkt []byte, gso stack.GSO, ipLen int) error {
 	if gso.Type == stack.GSONone {
-		return d.add(pkt)
+		_, err := d.add(pkt, 0)
+		return err
 	}
 	if !d.segs.init(pkt, ipLen, int(gso.MSS)) {
 		return nil
 	}
+	// Prepare can keep a packet that it drops. Thus a seal worker completes
+	// the TCP checksum only of a packet after one that the pipe took.
+	late := false
 	for seg := d.segs.next(); seg != nil; seg = d.segs.next() {
-		if err := d.add(seg); err != nil {
+		csum := 0
+		if late {
+			csum = ipLen
+		} else {
+			tcpChecksum(seg, ipLen)
+		}
+		ok, err := d.add(seg, csum)
+		if err != nil {
 			return err
 		}
+		late = ok && d.pipe != nil
 	}
 	return nil
 }
 
 // add adds the frame of the IP packet virt to the batch, or to the pipe. It
-// sends the batch first when it is full.
-func (d *Datapath) add(virt []byte) error {
+// sends the batch first when it is full. A csum above 0 is for the pipe only.
+// It returns false when the engine dropped the packet.
+func (d *Datapath) add(virt []byte, csum int) (bool, error) {
 	if d.pipe != nil {
-		return d.pipe.add(virt)
+		return d.pipe.add(virt, csum)
 	}
 	if d.nf == maxBatchSize {
 		if err := d.send(); err != nil {
-			return err
+			return false, err
 		}
 	}
 	b := d.slot()
 	// The engine runs in layer 3, so it makes no local reply.
-	if n, _ := d.engine.VirtToPhy(virt, b); n > 0 {
+	n, _ := d.engine.VirtToPhy(virt, b)
+	if n > 0 {
 		d.frames[d.nf] = b[:n]
 		d.nf++
 	}
-	return nil
+	return n > 0, nil
 }
 
 // slot returns the buffer for the next frame of the batch.
