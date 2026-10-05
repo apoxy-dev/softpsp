@@ -17,6 +17,9 @@ const (
 	// txSets is the number of frame sets of a send pipe with no seal workers.
 	// Each seal worker adds two sets.
 	txSets = 8
+	// txKeepSets is the number of sets that a pipe adds for a Keeper: the sets
+	// whose frames wait in the underlay.
+	txKeepSets = 16
 	// txSlots is the most frames in one set, and so in one underlay write.
 	txSlots = maxBatchSize
 	// maxSealWorkers is the most seal workers of a send pipe. A worker also
@@ -69,10 +72,12 @@ func sealWorkers(procs int) int {
 // sender, in send order. The pump gives each TCP packet of the endpoint to a
 // set as a run, and copies each other packet into a slot. A seal worker cuts
 // the runs, seals the set and gives a token. The sender takes the sets in
-// order, waits for the token and writes the frames to the underlay.
+// order, waits for the token and writes the frames to the underlay. A Keeper
+// sends the frames from the set, and the set is free after the last Release.
 type txPipe struct {
 	d       *Datapath
 	eng     Sealer
+	keeper  Keeper // The underlay when it can keep frames. Nil when it copies them.
 	mtu     int
 	workers int
 	work    chan *txSet // Sets for the seal workers.
@@ -90,7 +95,8 @@ type txPipe struct {
 }
 
 // txSet is the frames of one underlay write. One goroutine owns it at a time:
-// the pump, then a seal worker, then the sender.
+// the pump, then a seal worker, then the sender. After the write, a Keeper can
+// read the frames until the last Release of kept.
 type txSet struct {
 	_      cpu.CacheLinePad // Two sets do not have a cache line in common.
 	slots  []txSlot
@@ -98,6 +104,7 @@ type txSet struct {
 	runs   []txRun       // The TCP packets that a seal worker cuts, in slot order.
 	frames [][]byte      // The frames of the set, in order. The sealer fills it.
 	sealed chan struct{} // Gets one token when a seal worker finished the set.
+	kept   Kept          // The users of frames in a write to a Keeper.
 }
 
 // txSlot is one frame of a set.
@@ -134,8 +141,12 @@ func (s *txSet) drop() {
 // newTxPipe makes a pipe with workers seal workers, at least one.
 func newTxPipe(d *Datapath, eng Sealer, workers int) *txPipe {
 	sets := txSets + 2*workers
+	keeper, _ := d.underlay.(Keeper)
+	if keeper != nil {
+		sets += txKeepSets
+	}
 	mtu := int(d.ep.MTU())
-	p := &txPipe{d: d, eng: eng, mtu: mtu, workers: workers, work: make(chan *txSet, sets), full: make(chan *txSet, sets), free: make(chan *txSet, sets)}
+	p := &txPipe{d: d, eng: eng, keeper: keeper, mtu: mtu, workers: workers, work: make(chan *txSet, sets), full: make(chan *txSet, sets), free: make(chan *txSet, sets)}
 	size := mtu + eng.Overhead()
 	slab := make([]byte, sets*txSlots*(mtu+size))
 	all := make([]txSet, sets)
@@ -147,6 +158,7 @@ func newTxPipe(d *Datapath, eng Sealer, workers int) *txPipe {
 			s.slots[i].virt, slab = slab[:mtu:mtu], slab[mtu:]
 			s.slots[i].phy, slab = slab[:size:size], slab[size:]
 		}
+		s.kept.free = func() { p.release(s) }
 		p.free <- s
 	}
 	return p
@@ -371,10 +383,7 @@ func (p *txPipe) run() error {
 				p.stop()
 				return net.ErrClosed
 			}
-			err := p.d.write(s.frames)
-			s.reset()
-			p.free <- s
-			if err != nil {
+			if err := p.write(s); err != nil {
 				p.stop()
 				return err
 			}
@@ -383,6 +392,27 @@ func (p *txPipe) run() error {
 			return net.ErrClosed
 		}
 	}
+}
+
+// write writes the frames of s to the underlay and frees s. The sender is a
+// user of the frames in a write to a Keeper, so s is free only after the write.
+func (p *txPipe) write(s *txSet) error {
+	if p.keeper == nil {
+		err := p.d.write(s.frames, nil)
+		p.release(s)
+		return err
+	}
+	s.kept.Keep()
+	err := p.d.write(s.frames, &s.kept)
+	s.kept.Release()
+	return err
+}
+
+// release gives s, whose frames have no user, to the pump. The channel holds
+// all sets, so the send does not wait, also after the pipe stopped.
+func (p *txPipe) release(s *txSet) {
+	s.reset()
+	p.free <- s
 }
 
 // wait waits for the token of s. It returns false when the datapath closes.

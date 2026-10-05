@@ -203,6 +203,276 @@ func (u *syncUnderlay) count() int {
 	return len(u.frames)
 }
 
+func (u *syncUnderlay) sent() [][][]byte { return [][][]byte{u.frames} }
+
+// sendUnderlay is an underlay that keeps a copy of each frame that it sent.
+type sendUnderlay interface {
+	Underlay
+	Close()
+	count() int
+	// sent returns the frames of each lane, in send order. An underlay with no
+	// lanes has one.
+	sent() [][][]byte
+}
+
+// noLanes is the lanes of newSendUnderlay for an underlay that copies the
+// frames in the write.
+const noLanes = 0
+
+// newSendUnderlay returns a keepUnderlay with lanes lanes, or a syncUnderlay
+// for noLanes.
+func newSendUnderlay(lanes int) sendUnderlay {
+	if lanes == noLanes {
+		return newSyncUnderlay()
+	}
+	return newKeepUnderlay(lanes)
+}
+
+// laneEngine is a Sealer that puts the lane of the flow before each frame of
+// its Sealer, as the engine of apoxy does. The lane is the source port modulo
+// lanes, and the frames of the engine go on lane 0.
+type laneEngine struct {
+	Sealer
+	lanes int
+}
+
+func (e laneEngine) Overhead() int { return 1 + e.Sealer.Overhead() }
+
+func (e laneEngine) Prepare(virt []byte, f *TxFrame) bool {
+	f.Lane = int(srcPort(virt)) % e.lanes
+	return e.Sealer.Prepare(virt, f)
+}
+
+func (e laneEngine) PrepareSegs(hdr []byte, n, size, total int, f *TxFrame) bool {
+	f.Lane = int(srcPort(hdr)) % e.lanes
+	return e.Sealer.PrepareSegs(hdr, n, size, total, f)
+}
+
+func (e laneEngine) Seal(f *TxFrame, virt, phy []byte) int {
+	n := e.Sealer.Seal(f, virt, phy[1:])
+	if n == 0 {
+		return 0
+	}
+	phy[0] = byte(f.Lane)
+	return 1 + n
+}
+
+func (e laneEngine) VirtToPhy(virt, phy []byte) (int, bool) {
+	var f TxFrame
+	if !e.Prepare(virt, &f) {
+		return 0, false
+	}
+	return e.Seal(&f, virt, phy), false
+}
+
+func (e laneEngine) ToPhy(phy []byte) int {
+	n := e.Sealer.ToPhy(phy[1:])
+	if n == 0 {
+		return 0
+	}
+	phy[0] = 0
+	return 1 + n
+}
+
+// byLane returns the frames of each of n lanes, in the order of frames. The
+// first byte of a frame is its lane. For noLanes, all frames are one lane.
+func byLane(frames [][]byte, n int) [][][]byte {
+	if n == noLanes {
+		return [][][]byte{frames}
+	}
+	out := make([][][]byte, n)
+	for _, f := range frames {
+		out[f[0]] = append(out[f[0]], f)
+	}
+	return out
+}
+
+// keepUnderlay is a Keeper with one sender for each lane, as the underlay of
+// apoxy is. The first byte of a frame is its lane. A sender keeps the frames
+// of a write, and copies and releases them later.
+type keepUnderlay struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	queue   [][]keptFrames // The writes that each sender keeps, in write order.
+	lanes   [][][]byte     // Copies of the frames that each lane sent, in send order.
+	n       int            // The frames in lanes.
+	kept    int            // The frames in queue and with the senders.
+	users   map[*Kept]int  // The senders that keep frames of each write.
+	changed int            // Frames that changed while a sender kept them.
+	stopped bool
+
+	writeMax int           // When set, a write takes at most writeMax frames.
+	slow     bool          // A sender waits a random time before it sends.
+	hold     chan struct{} // When set, the senders wait until it closes.
+	keeps    atomic.Int64  // Keep calls.
+	releases atomic.Int64  // Release calls.
+	closed   chan struct{}
+	wg       sync.WaitGroup
+}
+
+// keptFrames is the frames of one write for one lane, and their copies from
+// the time of the write.
+type keptFrames struct {
+	frames, was [][]byte
+	k           *Kept
+}
+
+func newKeepUnderlay(lanes int) *keepUnderlay {
+	u := &keepUnderlay{queue: make([][]keptFrames, lanes), lanes: make([][][]byte, lanes), users: map[*Kept]int{}, closed: make(chan struct{})}
+	u.cond = sync.NewCond(&u.mu)
+	for l := range lanes {
+		u.wg.Go(func() { u.send(l) })
+	}
+	return u
+}
+
+func (u *keepUnderlay) ReadFrame([]byte) (int, error) {
+	<-u.closed
+	return 0, net.ErrClosed
+}
+
+// WriteFrames copies the frames at once. A datapath with no pipe calls it.
+func (u *keepUnderlay) WriteFrames(frames [][]byte) (int, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.stopped {
+		return 0, net.ErrClosed
+	}
+	for _, f := range frames {
+		u.lanes[f[0]] = append(u.lanes[f[0]], bytes.Clone(f))
+	}
+	u.n += len(frames)
+	return len(frames), nil
+}
+
+// WriteKept gives the frames to the senders of their lanes with no copy. Each
+// sender is one user of k.
+func (u *keepUnderlay) WriteKept(frames [][]byte, k *Kept) (int, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.stopped {
+		return 0, net.ErrClosed
+	}
+	if u.writeMax > 0 {
+		frames = frames[:min(len(frames), u.writeMax)]
+	}
+	for l := range u.queue {
+		kf := keptFrames{k: k}
+		for _, f := range frames {
+			if int(f[0]) == l {
+				kf.frames, kf.was = append(kf.frames, f), append(kf.was, bytes.Clone(f))
+			}
+		}
+		if len(kf.frames) > 0 {
+			k.Keep()
+			u.keeps.Add(1)
+			u.users[k]++
+			u.queue[l] = append(u.queue[l], kf)
+		}
+	}
+	u.kept += len(frames)
+	u.cond.Broadcast()
+	return len(frames), nil
+}
+
+// send is the sender of lane l. It stops after Close, when its queue is empty.
+func (u *keepUnderlay) send(l int) {
+	for {
+		u.mu.Lock()
+		for len(u.queue[l]) == 0 && !u.stopped {
+			u.cond.Wait()
+		}
+		if len(u.queue[l]) == 0 {
+			u.mu.Unlock()
+			return
+		}
+		kf := u.queue[l][0]
+		u.queue[l] = u.queue[l][1:]
+		u.mu.Unlock()
+		if u.hold != nil {
+			<-u.hold
+		}
+		if u.slow {
+			time.Sleep(time.Duration(rand.IntN(300)) * time.Microsecond)
+		}
+		u.mu.Lock()
+		for i, f := range kf.frames {
+			if !bytes.Equal(f, kf.was[i]) {
+				u.changed++
+			}
+		}
+		u.lanes[l] = append(u.lanes[l], kf.was...)
+		u.n += len(kf.frames)
+		u.kept -= len(kf.frames)
+		if u.users[kf.k]--; u.users[kf.k] == 0 {
+			delete(u.users, kf.k)
+		}
+		u.mu.Unlock()
+		kf.k.Release()
+		u.releases.Add(1)
+	}
+}
+
+// Close stops the underlay and waits until the senders sent all frames.
+func (u *keepUnderlay) Close() {
+	u.mu.Lock()
+	if !u.stopped {
+		u.stopped = true
+		close(u.closed)
+		u.cond.Broadcast()
+	}
+	u.mu.Unlock()
+	u.wg.Wait()
+}
+
+func (u *keepUnderlay) count() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.n
+}
+
+// keeping returns the number of frames that the senders keep, and the number
+// of writes that they are from.
+func (u *keepUnderlay) keeping() (frames, writes int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.kept, len(u.users)
+}
+
+func (u *keepUnderlay) sent() [][][]byte { return u.lanes }
+
+// waitFree waits until each set of the pipe of d is free, or is the empty set
+// of the pump. A pipe that sent all its frames must get there.
+func waitFree(t *testing.T, d *Datapath) {
+	t.Helper()
+	if p := d.pipe; p != nil {
+		require.Eventually(t, func() bool { return len(p.free) >= cap(p.free)-1 }, 10*time.Second, time.Millisecond, "free sets")
+	}
+}
+
+// checkSent checks the frames of a datapath that stopped: each lane of u sent
+// the frames of want, in order. No frame changed while u kept it, and u
+// released all frames.
+func checkSent(t *testing.T, u sendUnderlay, want [][][]byte) {
+	t.Helper()
+	got := u.sent()
+	require.Len(t, got, len(want))
+	for l := range want {
+		if !assert.Len(t, got[l], len(want[l]), "lane %d", l) {
+			continue
+		}
+		for i := range want[l] {
+			if !assert.True(t, bytes.Equal(want[l][i], got[l][i]), "lane %d, frame %d", l, i) {
+				break
+			}
+		}
+	}
+	if k, ok := u.(*keepUnderlay); ok {
+		assert.Zero(t, k.changed, "frames that changed while the underlay kept them")
+		assert.Equal(t, k.keeps.Load(), k.releases.Load(), "Keep and Release calls")
+	}
+}
+
 // noPipe is the workers of newPipeDatapath for a datapath with no send pipe.
 const noPipe = 0
 
@@ -222,7 +492,7 @@ func newPipeDatapath(t testing.TB, eng Sealer, u Underlay, workers int) *Datapat
 
 // run runs d until the returned function is called, which closes d and u and
 // waits for Run to return with no error.
-func run(t *testing.T, d *Datapath, u *syncUnderlay) func() {
+func run(t *testing.T, d *Datapath, u interface{ Close() }) func() {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -349,19 +619,24 @@ func TestSealWorkers(t *testing.T) {
 	}
 }
 
-// TestNewPipe checks that New makes a pipe only for a Sealer.
+// TestNewPipe checks that New makes a pipe only for a Sealer, and that only a
+// pipe with a Keeper has the sets of txKeepSets.
 func TestNewPipe(t *testing.T) {
 	want := sealWorkers(runtime.GOMAXPROCS(0))
 	for _, tc := range []struct {
 		name string
 		eng  Sealer
+		u    Underlay
 		pipe bool
+		sets int
 	}{
-		{"sealer", &seqEngine{}, want > 0},
-		{"plain engine", nil, false},
+		{"sealer", &seqEngine{}, newSyncUnderlay(), want > 0, txSets + 2*want},
+		{"sealer and keeper", &seqEngine{}, &nopKeeper{}, want > 0, txSets + 2*want + txKeepSets},
+		{"plain engine", nil, newSyncUnderlay(), false, 0},
+		{"plain engine and keeper", nil, &nopKeeper{}, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{Engine: fakeEngine{}, Endpoint: channel.New(1, testMTU, ""), Underlay: newSyncUnderlay()}
+			cfg := Config{Engine: fakeEngine{}, Endpoint: channel.New(1, testMTU, ""), Underlay: tc.u}
 			if tc.eng != nil {
 				cfg.Engine = tc.eng
 			}
@@ -371,6 +646,8 @@ func TestNewPipe(t *testing.T) {
 			assert.Equal(t, tc.pipe, d.pipe != nil)
 			if d.pipe != nil {
 				assert.Equal(t, want, d.pipe.workers)
+				assert.Equal(t, tc.sets, cap(d.pipe.free))
+				assert.Equal(t, tc.sets, len(d.pipe.free))
 			}
 		})
 	}
@@ -410,42 +687,47 @@ func TestTxPipe(t *testing.T) {
 	}
 	for _, tc := range cases {
 		for _, workers := range []int{noPipe, 1, 2, 4} {
-			t.Run(fmt.Sprintf("%s/workers=%d", tc.name, workers), func(t *testing.T) {
-				engine := func() *seqEngine {
-					e := &seqEngine{drop: tc.drop, segs: tc.segs, fail: tc.fail, shuffle: workers > 0}
-					for i := range tc.keep {
-						e.keep = append(e.keep, pattern(100+i))
+			for _, lanes := range []int{noLanes, 1, 3} {
+				t.Run(fmt.Sprintf("%s/workers=%d/lanes=%d", tc.name, workers, lanes), func(t *testing.T) {
+					engine := func() Sealer {
+						e := &seqEngine{drop: tc.drop, segs: tc.segs, fail: tc.fail, shuffle: workers > 0}
+						for i := range tc.keep {
+							e.keep = append(e.keep, pattern(100+i))
+						}
+						if lanes != noLanes {
+							return laneEngine{e, lanes}
+						}
+						return e
 					}
-					return e
-				}
-				// The frames of the pump with no pipe are the frames to expect.
-				wantU := newSyncUnderlay()
-				wantD := newPipeDatapath(t, engine(), wantU, noPipe)
-				writeTestPackets(t, wantD.ep, tc.pkts)
-				require.NoError(t, wantD.sendQueued())
-				want := wantU.frames
-				require.NotEmpty(t, want)
+					// The frames of the pump with no pipe are the frames to expect.
+					wantU := newSyncUnderlay()
+					wantD := newPipeDatapath(t, engine(), wantU, noPipe)
+					writeTestPackets(t, wantD.ep, tc.pkts)
+					require.NoError(t, wantD.sendQueued())
+					want := wantU.frames
+					require.NotEmpty(t, want)
 
-				u := newSyncUnderlay()
-				d := newPipeDatapath(t, engine(), u, workers)
-				stop := run(t, d, u)
-				writeTestPackets(t, d.ep, tc.pkts)
-				require.Eventually(t, func() bool { return u.count() >= len(want) }, 10*time.Second, time.Millisecond)
-				stop()
-				assert.Equal(t, len(want), u.count())
-				for i := range min(len(want), u.count()) {
-					if !assert.True(t, bytes.Equal(want[i], u.frames[i]), "frame %d", i) {
-						break
+					u := newSendUnderlay(lanes)
+					if k, ok := u.(*keepUnderlay); ok {
+						k.slow = true
 					}
-				}
-			})
+					d := newPipeDatapath(t, engine(), u, workers)
+					stop := run(t, d, u)
+					writeTestPackets(t, d.ep, tc.pkts)
+					require.Eventually(t, func() bool { return u.count() >= len(want) }, 10*time.Second, time.Millisecond)
+					waitFree(t, d)
+					stop()
+					checkSent(t, u, byLane(want, lanes))
+				})
+			}
 		}
 	}
 }
 
 // TestTxPipeBytes seals packets with a real SA, with and without a send pipe,
 // and opens the frames. Each inner packet must equal a packet that tcpPacket
-// makes whole, in send order.
+// makes whole, in send order. With lanes, a Keeper sends the frames of each
+// flow on one lane, and each lane must have its packets in send order.
 func TestTxPipeBytes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -461,25 +743,52 @@ func TestTxPipeBytes(t *testing.T) {
 		{name: "UDP", pkts: []testPacket{{udp: true, payload: 1200}, {udp: true, payload: 33}}},
 		{name: "many sets", pkts: []testPacket{{payload: 60_000, mss: 400}, {udp: true, payload: 100}, {v6: true, payload: 60_001, mss: 401}, {payload: 70}, {v6: true, payload: 30_000, mss: 1208}}},
 		{name: "flat packets", pkts: []testPacket{{payload: 4500, mss: 1000, flat: true}, {v6: true, payload: 60_001, mss: 401, flat: true}, {payload: 2501, mss: 999}}},
+		{name: "many flows", pkts: []testPacket{{payload: 60_000, mss: 400}, {v6: true, payload: 60_001, mss: 401}, {payload: 70}, {payload: 30_000, mss: 1208}, {udp: true, payload: 100}, {v6: true, payload: 60_000, mss: 400}, {payload: 9000, mss: 1000, flat: true}}},
 	}
 	for _, tc := range cases {
 		for _, workers := range []int{noPipe, 1, 2, 4} {
-			t.Run(fmt.Sprintf("%s/workers=%d", tc.name, workers), func(t *testing.T) {
-				want := wantPackets(t, tc.pkts)
-				eng := newPSPEngine(t)
-				u := newSyncUnderlay()
-				d := newPipeDatapath(t, eng, u, workers)
-				stop := run(t, d, u)
-				writeTestPackets(t, d.ep, tc.pkts)
-				require.Eventually(t, func() bool { return u.count() >= len(want) }, 10*time.Second, time.Millisecond)
-				stop()
-				require.Equal(t, len(want), u.count())
-				for i, f := range u.frames {
-					if !assert.True(t, bytes.Equal(want[i], eng.open(t, f)), "packet %d", i) {
-						break
+			for _, lanes := range []int{noLanes, 1, 3} {
+				t.Run(fmt.Sprintf("%s/workers=%d/lanes=%d", tc.name, workers, lanes), func(t *testing.T) {
+					want := wantPackets(t, tc.pkts)
+					eng := newPSPEngine(t)
+					var sealer Sealer = eng
+					if lanes != noLanes {
+						sealer = laneEngine{eng, lanes}
 					}
-				}
-			})
+					u := newSendUnderlay(lanes)
+					d := newPipeDatapath(t, sealer, u, workers)
+					stop := run(t, d, u)
+					writeTestPackets(t, d.ep, tc.pkts)
+					require.Eventually(t, func() bool { return u.count() >= len(want) }, 10*time.Second, time.Millisecond)
+					waitFree(t, d)
+					stop()
+					require.Equal(t, len(want), u.count())
+					if lanes == noLanes {
+						for i, f := range u.sent()[0] {
+							if !assert.True(t, bytes.Equal(want[i], eng.open(t, f)), "packet %d", i) {
+								break
+							}
+						}
+						return
+					}
+					// The lanes are not in one order, so no replay window checks the frames.
+					wantLanes := make([][][]byte, lanes)
+					for _, p := range want {
+						l := int(srcPort(p)) % lanes
+						wantLanes[l] = append(wantLanes[l], p)
+					}
+					got := u.sent()
+					for l := range got {
+						for i, f := range got[l] {
+							require.Equal(t, byte(l), f[0])
+							inner, _, err := eng.rx.Open(f[1:])
+							require.NoError(t, err)
+							got[l][i] = inner
+						}
+					}
+					checkSent(t, u, wantLanes)
+				})
+			}
 		}
 	}
 }
@@ -591,47 +900,145 @@ func TestTxPipeTooLarge(t *testing.T) {
 
 // TestTxPipeRelease checks that the pipe releases each packet of the endpoint
 // that it took, when it sends the frames and when the datapath closes first.
+// A Keeper must also get one Release for each Keep.
 func TestTxPipeRelease(t *testing.T) {
 	pkts := []testPacket{{payload: 60_000, mss: 400}, {v6: true, payload: 9000, mss: 1000}, {payload: 500}, {mss: 1000}, {payload: 60_000, mss: 400}, {payload: 60_000, mss: 400, flat: true}}
 	for _, closed := range []bool{false, true} {
 		for _, workers := range []int{1, 4} {
-			t.Run(fmt.Sprintf("closed=%t/workers=%d", closed, workers), func(t *testing.T) {
-				eng := &seqEngine{}
-				if closed {
-					eng.hold = make(chan struct{})
-				}
-				u := newSyncUnderlay()
-				d := newPipeDatapath(t, eng, u, workers)
-				stop := run(t, d, u)
-				// The test keeps one reference to each packet.
-				bufs := make([]*stack.PacketBuffer, 0, 3*len(pkts))
-				for range 3 {
-					for i, p := range pkts {
-						pkb := p.buffer(t, i)
-						bufs = append(bufs, pkb.IncRef())
-						var list stack.PacketBufferList
-						list.PushBack(pkb)
-						writePackets(t, d.ep, &list)
+			for _, lanes := range []int{noLanes, 3} {
+				t.Run(fmt.Sprintf("closed=%t/workers=%d/lanes=%d", closed, workers, lanes), func(t *testing.T) {
+					seq := &seqEngine{}
+					if closed {
+						seq.hold = make(chan struct{})
 					}
-				}
-				if closed {
-					require.Eventually(t, func() bool { return eng.holding.Load() > 0 }, 10*time.Second, time.Millisecond)
-					require.NoError(t, d.Close())
-					close(eng.hold)
-				} else {
-					require.Eventually(t, func() bool { return u.count() >= 3*(150+9+1+1+150+150) }, 10*time.Second, time.Millisecond)
-				}
-				stop()
-				// The packets that the pump did not read are in the endpoint.
-				for pkb := d.ep.Read(); pkb != nil; pkb = d.ep.Read() {
-					pkb.DecRef()
-				}
-				for i, pkb := range bufs {
-					assert.Equal(t, int64(1), pkb.ReadRefs(), "packet %d", i)
-					pkb.DecRef()
-				}
-			})
+					var eng Sealer = seq
+					if lanes != noLanes {
+						eng = laneEngine{seq, lanes}
+					}
+					u := newSendUnderlay(lanes)
+					d := newPipeDatapath(t, eng, u, workers)
+					stop := run(t, d, u)
+					// The test keeps one reference to each packet.
+					bufs := make([]*stack.PacketBuffer, 0, 3*len(pkts))
+					for range 3 {
+						for i, p := range pkts {
+							pkb := p.buffer(t, i)
+							bufs = append(bufs, pkb.IncRef())
+							var list stack.PacketBufferList
+							list.PushBack(pkb)
+							writePackets(t, d.ep, &list)
+						}
+					}
+					if closed {
+						require.Eventually(t, func() bool { return seq.holding.Load() > 0 }, 10*time.Second, time.Millisecond)
+						require.NoError(t, d.Close())
+						close(seq.hold)
+					} else {
+						require.Eventually(t, func() bool { return u.count() >= 3*(150+9+1+1+150+150) }, 10*time.Second, time.Millisecond)
+					}
+					stop()
+					// The packets that the pump did not read are in the endpoint.
+					for pkb := d.ep.Read(); pkb != nil; pkb = d.ep.Read() {
+						pkb.DecRef()
+					}
+					for i, pkb := range bufs {
+						assert.Equal(t, int64(1), pkb.ReadRefs(), "packet %d", i)
+						pkb.DecRef()
+					}
+					if k, ok := u.(*keepUnderlay); ok {
+						assert.Equal(t, k.keeps.Load(), k.releases.Load(), "Keep and Release calls")
+					}
+				})
+			}
 		}
+	}
+}
+
+// TestTxPipeKeep makes a Keeper hold the frames of more packets than the sets
+// of the pipe have. The pump must wait when all sets have users, and no frame
+// can change before its Release. Each set must be free after its last Release,
+// also when the datapath closed first.
+func TestTxPipeKeep(t *testing.T) {
+	const lanes = 3
+	// 60 packets of 150 frames each: 141 sets.
+	pkts := make([]testPacket, 60)
+	for i := range pkts {
+		pkts[i] = testPacket{payload: 60_000, mss: 400}
+	}
+	wantU := newSyncUnderlay()
+	wantD := newPipeDatapath(t, laneEngine{&seqEngine{}, lanes}, wantU, noPipe)
+	writeTestPackets(t, wantD.ep, pkts)
+	require.NoError(t, wantD.sendQueued())
+	want := wantU.frames
+
+	cases := []struct {
+		name string
+		// closed closes the datapath while the underlay keeps the frames.
+		closed  bool
+		workers int
+		// writeMax makes each write of the underlay short.
+		writeMax int
+	}{
+		{name: "release", workers: 1},
+		{name: "release, 4 workers", workers: 4},
+		{name: "release, short writes", workers: 2, writeMax: 7},
+		{name: "close before the release", closed: true, workers: 1},
+		{name: "close before the release, 4 workers", closed: true, workers: 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := newKeepUnderlay(lanes)
+			u.hold, u.writeMax = make(chan struct{}), tc.writeMax
+			d := newPipeDatapath(t, laneEngine{&seqEngine{}, lanes}, u, tc.workers)
+			sets := cap(d.pipe.free)
+			require.Equal(t, txSets+2*tc.workers+txKeepSets, sets)
+			stop := run(t, d, u)
+			bufs := make([]*stack.PacketBuffer, len(pkts))
+			for i, p := range pkts {
+				bufs[i] = p.buffer(t, i).IncRef()
+				var list stack.PacketBufferList
+				list.PushBack(bufs[i])
+				writePackets(t, d.ep, &list)
+			}
+			// The underlay keeps the frames of all sets, and then the pump waits.
+			require.Eventually(t, func() bool { _, n := u.keeping(); return n == sets }, 10*time.Second, time.Millisecond)
+			kept, _ := u.keeping()
+			time.Sleep(20 * time.Millisecond)
+			frames, n := u.keeping()
+			require.Equal(t, sets, n)
+			require.Equal(t, kept, frames)
+			require.Less(t, kept, len(want))
+			require.Empty(t, d.pipe.free)
+			require.Zero(t, u.count())
+
+			if tc.closed {
+				require.NoError(t, d.Close())
+				// The seal workers and the sender stop while the underlay keeps the frames.
+				require.Eventually(t, func() bool {
+					d.pipe.mu.Lock()
+					defer d.pipe.mu.Unlock()
+					return d.pipe.closing
+				}, 10*time.Second, time.Millisecond)
+				close(u.hold)
+				stop()
+				checkSent(t, u, byLane(want[:kept], lanes))
+				// The underlay kept all sets, so all of them are free now.
+				require.Len(t, d.pipe.free, sets)
+			} else {
+				close(u.hold)
+				require.Eventually(t, func() bool { return u.count() >= len(want) }, 10*time.Second, time.Millisecond)
+				waitFree(t, d)
+				stop()
+				checkSent(t, u, byLane(want, lanes))
+			}
+			for pkb := d.ep.Read(); pkb != nil; pkb = d.ep.Read() {
+				pkb.DecRef()
+			}
+			for i, pkb := range bufs {
+				assert.Equal(t, int64(1), pkb.ReadRefs(), "packet %d", i)
+				pkb.DecRef()
+			}
+		})
 	}
 }
 
@@ -753,9 +1160,30 @@ type refuseEngine struct{ *pspEngine }
 
 func (refuseEngine) PrepareSegs([]byte, int, int, int, *TxFrame) bool { return false }
 
+// nopKeeper drops the frames that it gets. It is a user of the frames of each
+// write until release.
+type nopKeeper struct {
+	nopUnderlay
+	kept []*Kept
+}
+
+func (u *nopKeeper) WriteKept(frames [][]byte, k *Kept) (int, error) {
+	k.Keep()
+	u.kept = append(u.kept, k)
+	return len(frames), nil
+}
+
+func (u *nopKeeper) release() {
+	for _, k := range u.kept {
+		k.Release()
+	}
+	u.kept = u.kept[:0]
+}
+
 // TestTxPipeNoAllocs runs the steps of the send path of a pipe one after the
 // other: the pump, a seal worker and the sender. They must not allocate, when
-// a seal worker cuts the TCP packet and when the pump cuts it.
+// a seal worker cuts the TCP packet and when the pump cuts it, and when the
+// underlay copies the frames and when it keeps them.
 func TestTxPipeNoAllocs(t *testing.T) {
 	pkts, mss, size := benchPackets(true)
 	plain, _, _ := benchPackets(false)
@@ -763,12 +1191,20 @@ func TestTxPipeNoAllocs(t *testing.T) {
 		name string
 		eng  func(*pspEngine) Sealer
 		runs int
+		keep bool
 	}{
-		{"seal worker cuts", func(e *pspEngine) Sealer { return e }, 1},
-		{"pump cuts", func(e *pspEngine) Sealer { return refuseEngine{e} }, 0},
+		{"seal worker cuts", func(e *pspEngine) Sealer { return e }, 1, false},
+		{"pump cuts", func(e *pspEngine) Sealer { return refuseEngine{e} }, 0, false},
+		{"seal worker cuts, underlay keeps", func(e *pspEngine) Sealer { return e }, 1, true},
+		{"pump cuts, underlay keeps", func(e *pspEngine) Sealer { return refuseEngine{e} }, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d := newPipeDatapath(t, tc.eng(newPSPEngine(t)), nopUnderlay{}, 1)
+			var u Underlay = nopUnderlay{}
+			keeper := &nopKeeper{kept: make([]*Kept, 0, 1)}
+			if tc.keep {
+				u = keeper
+			}
+			d := newPipeDatapath(t, tc.eng(newPSPEngine(t)), u, 1)
 			p := d.pipe
 			c := &segCut{p: p}
 			// The pipe takes its own references, so the test sends the packets
@@ -795,12 +1231,18 @@ func TestTxPipeNoAllocs(t *testing.T) {
 				if len(s.frames) != size/mss+1 {
 					t.Fatalf("%d frames, want %d", len(s.frames), size/mss+1)
 				}
-				if err := d.write(s.frames); err != nil {
+				<-p.full
+				if err := p.write(s); err != nil {
 					t.Fatal(err)
 				}
-				<-p.full
-				s.reset()
-				p.free <- s
+				// The set is free only after the underlay releases it.
+				if tc.keep && len(p.free) != cap(p.free)-1 {
+					t.Fatalf("%d free sets before the release, want %d", len(p.free), cap(p.free)-1)
+				}
+				keeper.release()
+				if len(p.free) != cap(p.free) {
+					t.Fatalf("%d free sets, want %d", len(p.free), cap(p.free))
+				}
 			}); a != 0 {
 				t.Fatalf("send path: %v allocs per run, want 0", a)
 			}
@@ -822,6 +1264,17 @@ func (u countUnderlay) ReadFrame([]byte) (int, error) {
 
 func (u countUnderlay) WriteFrames(frames [][]byte) (int, error) {
 	u.n <- len(frames)
+	return len(frames), nil
+}
+
+// countKeeper is a countUnderlay that is a Keeper. It keeps no frame after a
+// write.
+type countKeeper struct{ countUnderlay }
+
+func (u countKeeper) WriteKept(frames [][]byte, k *Kept) (int, error) {
+	k.Keep()
+	u.n <- len(frames)
+	k.Release()
 	return len(frames), nil
 }
 
@@ -911,19 +1364,24 @@ func BenchmarkTxPipe(b *testing.B) {
 	for _, eng := range engines {
 		for _, workers := range []int{noPipe, 1, 2, 4} {
 			b.Run(fmt.Sprintf("%sworkers=%d", eng.name, workers), func(b *testing.B) {
-				benchTxPipe(b, eng.make(), workers)
+				benchTxPipe(b, eng.make(), workers, false)
 			})
 		}
 	}
+	b.Run("psp/workers=4/keep", func(b *testing.B) { benchTxPipe(b, newPSPEngine(b), 4, true) })
 }
 
-func benchTxPipe(b *testing.B, eng Sealer, workers int) {
+func benchTxPipe(b *testing.B, eng Sealer, workers int, keep bool) {
 	pkts, mss, size := benchPackets(true)
-	u := countUnderlay{n: make(chan int, 1024), closed: make(chan struct{})}
+	cu := countUnderlay{n: make(chan int, 1024), closed: make(chan struct{})}
+	var u Underlay = cu
+	if keep {
+		u = countKeeper{cu}
+	}
 	d := newPipeDatapath(b, eng, u, workers)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	defer close(u.closed)
+	defer close(cu.closed)
 	go func() { _ = d.Run(ctx) }()
 	segs := size / mss
 	var list stack.PacketBufferList
@@ -937,7 +1395,7 @@ func benchTxPipe(b *testing.B, eng Sealer, workers int) {
 		}
 		writePackets(b, d.ep, &list)
 		for got := 0; got < benchBurst*segs; {
-			got += <-u.n
+			got += <-cu.n
 		}
 	}
 }

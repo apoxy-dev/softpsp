@@ -52,6 +52,37 @@ type Underlay interface {
 	WriteFrames(frames [][]byte) (int, error)
 }
 
+// Keeper is an Underlay that can keep the frames of a write after the write
+// returns, and send them on other goroutines with no copy. The send pipe
+// writes to a Keeper with WriteKept only.
+type Keeper interface {
+	// WriteKept is WriteFrames for frames that the underlay can keep. Before
+	// it returns, it calls k.Keep one time for each group of frames that it
+	// keeps. It calls k.Release after it sent or dropped a group.
+	WriteKept(frames [][]byte, k *Kept) (int, error)
+}
+
+// Kept counts the users of the frames of one write. The frames do not change
+// while they have a user.
+type Kept struct {
+	users atomic.Int32
+	free  func() // Runs when the last user releases the frames.
+}
+
+// NewKept returns a Kept with no user. It calls free each time the last user
+// releases the frames.
+func NewKept(free func()) *Kept { return &Kept{free: free} }
+
+// Keep adds a user of the frames. Only a user or the write can call it.
+func (k *Kept) Keep() { k.users.Add(1) }
+
+// Release removes a user. Each Keep needs one Release, on any goroutine.
+func (k *Kept) Release() {
+	if k.users.Add(-1) == 0 {
+		k.free()
+	}
+}
+
 // Config configures a Datapath. Engine, Endpoint and Underlay are required.
 type Config struct {
 	// Engine encrypts and decrypts the frames. It must run in layer 3 mode.
@@ -356,7 +387,7 @@ func (d *Datapath) slot() []byte {
 // send writes the batch to the underlay and empties it. It returns an error
 // only when the underlay or the datapath closes.
 func (d *Datapath) send() error {
-	err := d.write(d.frames[:d.nf])
+	err := d.write(d.frames[:d.nf], nil)
 	for i, b := range d.bufs {
 		if b != nil {
 			d.pktPool.Put(b)
@@ -378,11 +409,17 @@ func (d *Datapath) send() error {
 
 // write writes frames to the underlay. It sends again the frames that a short
 // write did not send. It logs a failed write, and returns an error only when
-// the underlay closes.
-func (d *Datapath) write(frames [][]byte) error {
+// the underlay closes. With k, the underlay of the pipe can keep the frames.
+func (d *Datapath) write(frames [][]byte, k *Kept) error {
 	out := frames
 	for len(out) > 0 {
-		n, err := d.underlay.WriteFrames(out)
+		var n int
+		var err error
+		if k != nil {
+			n, err = d.pipe.keeper.WriteKept(out, k)
+		} else {
+			n, err = d.underlay.WriteFrames(out)
+		}
 		if n > 0 {
 			out = out[n:]
 		}
