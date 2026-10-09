@@ -42,6 +42,12 @@ type PeerConfig struct {
 	Lanes int
 	// Sources is the source check of the SAs, for example Routes.Sources.
 	Sources func(netip.Addr) bool
+	// Trunk makes trunk SAs (engine.RxSA.Trunk), for the packets from another
+	// relay. They have no VNI and no Sources.
+	Trunk bool
+	// NoReplayLanes is the number of trunk lanes, from lane 0, whose SAs have
+	// no replay window (engine.RxSA.NoReplay).
+	NoReplayLanes int
 }
 
 // Peer is one sender of a Receiver.
@@ -105,8 +111,14 @@ func (r *Receiver) NewPeer(cfg PeerConfig) (*Peer, error) {
 	switch {
 	case cfg.Lanes < 1 || cfg.Lanes > MaxLanes:
 		return nil, fmt.Errorf("keys: lanes must be 1 to %d, got %d", MaxLanes, cfg.Lanes)
-	case cfg.Sources == nil:
+	case cfg.Trunk && (cfg.VNI != 0 || cfg.Sources != nil):
+		return nil, errors.New("keys: a trunk peer has no VNI and no source check")
+	case !cfg.Trunk && cfg.Sources == nil:
 		return nil, errors.New("keys: no source check")
+	case !cfg.Trunk && cfg.NoReplayLanes != 0:
+		return nil, errors.New("keys: only a trunk peer can have lanes with no replay window")
+	case cfg.NoReplayLanes < 0 || cfg.NoReplayLanes > cfg.Lanes:
+		return nil, fmt.Errorf("keys: lanes with no replay window must be 0 to %d, got %d", cfg.Lanes, cfg.NoReplayLanes)
 	}
 	return &Peer{r: r, cfg: cfg, lanes: make([]*rxSA, cfg.Lanes)}, nil
 }
@@ -237,6 +249,8 @@ func (p *Peer) replace(lanes []int, now time.Time) ([]SA, error) {
 			Sources:     p.cfg.Sources,
 			MTU:         p.cfg.MTU,
 			Lane:        owner,
+			Trunk:       p.cfg.Trunk,
+			NoReplay:    lane < p.cfg.NoReplayLanes,
 		})
 		if err != nil {
 			for _, sa := range made {

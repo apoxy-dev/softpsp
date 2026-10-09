@@ -16,7 +16,7 @@ const (
 )
 
 // RxQueue is one receive queue. Only one goroutine at a time can call
-// Receive, Accept or Drain on it. Open is safe for concurrent use.
+// Receive, ReceiveTrunk, Accept or Drain on it. Open is safe for concurrent use.
 type RxQueue struct {
 	t     *RxTable
 	id    int32

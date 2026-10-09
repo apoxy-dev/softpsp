@@ -22,6 +22,9 @@ import (
 //	24+n 16 ICV
 //
 // The AAD is bytes 0-23 and the AES-GCM nonce is SPI || IV (bytes 4-15).
+//
+// On a trunk SA the VNI field holds a tag from the sender, and Next Header 63
+// means that the payload is a whole PSP packet.
 const (
 	HeaderLen = 16                // PSP header up to and including the IV.
 	VCLen     = 8                 // Virtualization cookie: VNI word and sequence number.
@@ -31,6 +34,9 @@ const (
 	MaxVNI    = 1<<24 - 1
 	NextHdrV4 = 4  // Next Header for an inner IPv4 packet.
 	NextHdrV6 = 41 // Next Header for an inner IPv6 packet.
+	// NextHdrPSP is the Next Header for a whole PSP packet as the payload, on
+	// a trunk SA only. Below 64, a socket with QUIC reads it as not QUIC.
+	NextHdrPSP = 63
 
 	// FlagSeq is flag S of the VNI word: the VC carries a 32-bit sequence number.
 	FlagSeq uint8 = 0x80
@@ -62,7 +68,7 @@ var (
 
 // Header is the PSP header and VC of a tunnel-mode packet.
 type Header struct {
-	NextHdr uint8 // NextHdrV4 or NextHdrV6. Seal takes it from the inner packet.
+	NextHdr uint8 // NextHdrV4, NextHdrV6 or NextHdrPSP. Seal takes it from the inner packet.
 	Version Version
 	SPI     uint32
 	IV      uint64
@@ -104,6 +110,25 @@ func ParseHeader(pkt []byte) (Header, error) {
 		Flags:   uint8(w),
 		Seq:     binary.BigEndian.Uint32(pkt[20:24]),
 	}, nil
+}
+
+// ParseTrunkHeader is ParseHeader for a packet of a trunk SA. It also accepts
+// NextHdrPSP.
+func ParseTrunkHeader(pkt []byte) (Header, error) {
+	if len(pkt) < Overhead || pkt[0] != NextHdrPSP {
+		return ParseHeader(pkt)
+	}
+	// The other checks do not read Next Header, so ParseHeader does them on a
+	// copy of the header with a value that it accepts.
+	var b [Overhead]byte
+	copy(b[:], pkt[:PrefixLen])
+	b[0] = NextHdrV4
+	h, err := ParseHeader(b[:])
+	if err != nil {
+		return Header{}, err
+	}
+	h.NextHdr = NextHdrPSP
+	return h, nil
 }
 
 // check returns an error if Seal cannot send h.

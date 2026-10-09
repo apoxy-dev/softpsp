@@ -2,7 +2,8 @@
 
 // Package keys creates and changes PSP SAs. Each receiver creates its SAs as
 // (SPI, KDF(master, SPI)) and gives each one to one sender in a Request. The
-// same code serves the peer session and the relay session.
+// same code serves the peer session, the relay session and the trunk between
+// two relays.
 //
 // A Request holds raw keys. Send it only inside the mTLS session to the sender.
 package keys

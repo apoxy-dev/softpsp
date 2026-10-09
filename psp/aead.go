@@ -46,6 +46,21 @@ func Seal(aead cipher.AEAD, h Header, dst, inner []byte) (int, error) {
 	return len(inner) + Overhead, nil
 }
 
+// SealPSP is Seal for a payload that is a whole PSP packet, as a trunk SA
+// carries it. It sets NextHdr to NextHdrPSP and does not read the payload.
+func SealPSP(aead cipher.AEAD, h Header, dst, pkt []byte) (int, error) {
+	if len(dst) < len(pkt)+Overhead {
+		return 0, ErrBuffer
+	}
+	h.NextHdr = NextHdrPSP
+	if err := h.check(); err != nil {
+		return 0, err
+	}
+	h.put(dst)
+	aead.Seal(dst[PrefixLen:PrefixLen], dst[nonceOff:HeaderLen], pkt, dst[:PrefixLen])
+	return len(pkt) + Overhead, nil
+}
+
 // SealInPlace encrypts the inner IP packet buf[off:off+n] in place. The header
 // goes in the PrefixLen bytes before off and the ICV in the ICVLen bytes after
 // the packet. It returns the start and the length of the PSP packet in buf.
@@ -97,6 +112,26 @@ func OpenInPlace(aead cipher.AEAD, pkt []byte) ([]byte, error) {
 		return nil, ErrNextHdr
 	}
 	return inner, nil
+}
+
+// OpenTrunkInPlace is OpenInPlace for a packet of a trunk SA, after
+// ParseTrunkHeader. It does not read a NextHdrPSP payload.
+func OpenTrunkInPlace(aead cipher.AEAD, pkt []byte) ([]byte, error) {
+	if len(pkt) < Overhead {
+		return nil, ErrShort
+	}
+	ct := pkt[PrefixLen:]
+	payload, err := aead.Open(ct[:0], pkt[nonceOff:HeaderLen], ct, pkt[:PrefixLen])
+	if err != nil {
+		return nil, ErrAuth
+	}
+	if pkt[0] == NextHdrPSP {
+		return payload, nil
+	}
+	if nh, ok := nextHdr(payload); !ok || nh != pkt[0] {
+		return nil, ErrNextHdr
+	}
+	return payload, nil
 }
 
 // prepare sets h.NextHdr from the inner packet and checks h.

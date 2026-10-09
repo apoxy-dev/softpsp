@@ -16,7 +16,7 @@ without notice.
 | --- | --- |
 | `psp` | PSP tunnel-mode packet codec, key derivation (AES-CMAC KDF) and the SPI master key index. |
 | `interop` | Checks of `psp` against the [google/psp](https://github.com/google/psp) reference code. |
-| `engine` | Packet engine. Receive SA rows: SPI lookup, decryption, VNI, source, packet limit and replay checks. Receive queues: each SA has one owner queue, and other queues hand its packets to it. Transmit SAs. Routes (cryptokey routing): inner prefix to peer, for the send side and the source check; changes are one route at a time. |
+| `engine` | Packet engine. Receive SA rows: SPI lookup, decryption, VNI, source, packet limit and replay checks. Receive queues: each SA has one owner queue, and other queues hand its packets to it. Transmit SAs. Trunk SAs between two relays: a tag from the sender in the VNI field, a whole PSP packet or an inner IP packet as payload, and a replay window that can be off. Routes (cryptokey routing): inner prefix to peer, for the send side and the source check; changes are one route at a time. |
 | `keys` | Receiver-created SAs: two master keys, offers, rekeys, revokes, and the transmit SAs of a sender. |
 | `replay` | RFC 6479 anti-replay window on the 32-bit sequence number. |
 | `vtep` | Datapath contract and drivers: `tun`, `netstack`, `afxdp`. |
