@@ -26,6 +26,9 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 
 	"github.com/apoxy-dev/softpsp/permissions"
 )
@@ -239,51 +242,31 @@ func packet(t testing.TB, src, dst netip.AddrPort, ttl uint8, payload []byte) []
 	return buf.Bytes()
 }
 
-// sum16 returns the one's complement sum of b, with initial sum s.
-func sum16(s uint32, b []byte) uint32 {
-	for i := 0; i+1 < len(b); i += 2 {
-		s += uint32(binary.BigEndian.Uint16(b[i:]))
-	}
-	if len(b)%2 == 1 {
-		s += uint32(b[len(b)-1]) << 8
-	}
-	return s
-}
-
-func fold(s uint32) uint16 {
-	for s > 0xffff {
-		s = s&0xffff + s>>16
-	}
-	return uint16(s)
-}
-
 // fixIPv4Sum sets the header checksum of the IPv4 header h.
 func fixIPv4Sum(h []byte) {
-	h[10], h[11] = 0, 0
-	binary.BigEndian.PutUint16(h[10:12], ^fold(sum16(0, h)))
+	ip := header.IPv4(h)
+	ip.SetChecksum(0)
+	ip.SetChecksum(^ip.CalculateChecksum())
 }
 
 // checkSums checks the IPv4 header checksum and the UDP checksum of frame.
 func checkSums(t *testing.T, frame []byte) {
 	t.Helper()
-	var src, dst []byte
-	var udp []byte
+	var src, dst tcpip.Address
+	var udp header.UDP
 	if binary.BigEndian.Uint16(frame[12:14]) == 0x0800 {
-		ip := frame[14:34]
-		assert.Equal(t, uint16(0xffff), fold(sum16(0, ip)), "IPv4 header checksum")
-		src, dst, udp = ip[12:16], ip[16:20], frame[34:]
+		ip := header.IPv4(frame[14:34])
+		assert.True(t, ip.IsChecksumValid(), "IPv4 header checksum")
+		src, dst, udp = ip.SourceAddress(), ip.DestinationAddress(), frame[34:]
 	} else {
-		ip := frame[14:54]
-		src, dst, udp = ip[8:24], ip[24:40], frame[54:]
+		ip := header.IPv6(frame[14:54])
+		src, dst, udp = ip.SourceAddress(), ip.DestinationAddress(), frame[54:]
 	}
-	udp = udp[:binary.BigEndian.Uint16(udp[4:6])]
-	if binary.BigEndian.Uint16(udp[6:8]) == 0 {
+	udp = udp[:udp.Length()]
+	if udp.Checksum() == 0 {
 		return
 	}
-	s := sum16(0, src)
-	s = sum16(s, dst)
-	s += uint32(unix.IPPROTO_UDP) + uint32(len(udp))
-	assert.Equal(t, uint16(0xffff), fold(sum16(s, udp)), "UDP checksum")
+	assert.True(t, udp.IsChecksumValid(src, dst, checksum.Checksum(udp.Payload(), 0)), "UDP checksum")
 }
 
 // newTestRelay loads a relay program with the test port, length bound and addresses.
@@ -292,10 +275,7 @@ func newTestRelay(t testing.TB, cfg RelayConfig) *Relay {
 	cfg.Port = relayPort
 	cfg.MaxLen = testMaxLen
 	r, err := NewRelay(cfg)
-	if errors.Is(err, unix.EPERM) {
-		skipOrFail(t, "cannot load BPF programs: %v", err)
-	}
-	require.NoError(t, err)
+	requireLoad(t, err)
 	t.Cleanup(func() { _ = r.Close() })
 	require.NoError(t, r.SetAddrs([]netip.Addr{relay4, relay6}))
 	return r

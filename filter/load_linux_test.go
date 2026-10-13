@@ -17,7 +17,7 @@ import (
 
 // requireLoad fails the test with the full verifier log when a program did
 // not load. A process with no rights to load BPF programs gets skipOrFail.
-func requireLoad(t *testing.T, err error) {
+func requireLoad(t testing.TB, err error) {
 	t.Helper()
 	if errors.Is(err, unix.EPERM) {
 		skipOrFail(t, "cannot load BPF programs: %v", err)
