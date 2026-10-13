@@ -166,7 +166,9 @@ func (m *Softpsp) Kernels(
 		out, err := execStdout(ctx, c.
 			WithFile("/kernel/vmlinuz", vmlinuz).
 			WithExec([]string{
-				"vimto", "-kernel", "/kernel/vmlinuz", "-memory", "size=1G", "-smp", "cpus=2", "--",
+				// One CPU: a guest without KVM can panic at boot when a second CPU
+				// takes an interrupt while the kernel changes its code. The load test needs one.
+				"vimto", "-kernel", "/kernel/vmlinuz", "-memory", "size=1G", "-smp", "cpus=1", "--",
 				"go", "test", "-count=1", "-v", "-run", "^" + loadTest + "$", "./filter",
 			}))
 		b.WriteString(out)
