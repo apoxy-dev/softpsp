@@ -3,7 +3,7 @@
 
 // Package main is the softpsp Dagger CI/test harness.
 //
-// It has three lanes, which run locally (`dagger call <fn>`) and in GitHub
+// It has four lanes, which run locally (`dagger call <fn>`) and in GitHub
 // Actions:
 //
 //   - Unit: go build and go vet over the module, then the tests minus the
@@ -11,6 +11,8 @@
 //   - Integration: the whole tree WITH the root capability set, on a real
 //     kernel, so the veth/AF_XDP/forwarder tests actually run.
 //   - Interop: the interop tests against the google/psp reference code.
+//   - Kernels: the test that loads the relay XDP program, on each supported
+//     kernel in a QEMU guest.
 //
 // Every command is run as a real argv — no `sh -c` — so there is no
 // shell-quoting surface; the package filtering for Unit is done in Go against
@@ -35,6 +37,23 @@ const (
 	pspRefRepo   = "https://github.com/google/psp"
 	pspRefCommit = "8ac5fc19be57fbff18f44bb0b1d8e91c34b7260a"
 )
+
+// vimtoPkg is the tool that runs a Go test in a QEMU guest.
+const vimtoPkg = "lmb.io/vimto@v0.4.0"
+
+// kernelImage has a kernel at /boot/vmlinuz for each of its tags.
+const kernelImage = "ghcr.io/cilium/ci-kernels"
+
+// loadTest is the test that loads the relay XDP program.
+const loadTest = "TestProgramsLoad"
+
+// requireBPFEnv makes a filter test fail where it skips for a lack of rights.
+// The lanes that give the tests those rights set it.
+const requireBPFEnv = "SOFTPSP_REQUIRE_BPF"
+
+// defaultKernels are the long-term kernels that have all helpers of the
+// program (Linux 5.11), and the newest stable kernel.
+var defaultKernels = []string{"5.15", "6.1", "6.6", "6.12", "stable"}
 
 // privilegedPkgRe matches the packages whose tests need the root capability
 // set: they create veth pairs / AF_XDP sockets. Unit filters them out of
@@ -105,7 +124,61 @@ func (m *Softpsp) Integration(
 	// +default=true
 	race bool,
 ) (string, error) {
-	return runSuite(ctx, m.BuilderContainer(src), goTestArgs(race), []string{"./..."}, true)
+	c := m.BuilderContainer(src).WithEnvVariable(requireBPFEnv, "1")
+	return runSuite(ctx, c, goTestArgs(race), []string{"./..."}, true)
+}
+
+// Kernels loads the relay XDP program on each kernel, which is a tag of
+// ghcr.io/cilium/ci-kernels. A QEMU guest without KVM runs the load test, so
+// each runner can run it. A kernel that rejects the program fails the call.
+func (m *Softpsp) Kernels(
+	ctx context.Context,
+	src *dagger.Directory,
+	// Kernels to test. The default is 5.15, 6.1, 6.6, 6.12 and stable.
+	// +optional
+	kernels []string,
+) (string, error) {
+	if len(kernels) == 0 {
+		kernels = defaultKernels
+	}
+	platform, err := dag.DefaultPlatform(ctx)
+	if err != nil {
+		return "", fmt.Errorf("default platform: %w", err)
+	}
+	qemu := "qemu-system-x86"
+	if strings.HasPrefix(string(platform), "linux/arm64") {
+		qemu = "qemu-system-arm"
+	}
+	c := m.BuilderContainer(src).
+		WithExec([]string{"apt-get", "install", "-y", "-qq", "--no-install-recommends", qemu}).
+		// vimto runs only as a static binary.
+		WithEnvVariable("CGO_ENABLED", "0").
+		WithExec([]string{"go", "install", vimtoPkg}).
+		WithoutEnvVariable("CGO_ENABLED").
+		WithEnvVariable("VIMTO_DISABLE_KVM", "true").
+		WithEnvVariable(requireBPFEnv, "1")
+
+	var b strings.Builder
+	var errs []error
+	for _, k := range kernels {
+		fmt.Fprintf(&b, "===== kernel %s =====\n", k)
+		vmlinuz := dag.Container().From(kernelImage + ":" + k).File("/boot/vmlinuz")
+		out, err := execStdout(ctx, c.
+			WithFile("/kernel/vmlinuz", vmlinuz).
+			WithExec([]string{
+				"vimto", "-kernel", "/kernel/vmlinuz", "-memory", "size=1G", "-smp", "cpus=2", "--",
+				"go", "test", "-count=1", "-v", "-run", "^" + loadTest + "$", "./filter",
+			}))
+		b.WriteString(out)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("kernel %s: %w", k, err))
+		case !strings.Contains(out, "--- PASS: "+loadTest+" ") || strings.Contains(out, "--- SKIP: "):
+			// A run with no test or with a skip also exits with 0.
+			errs = append(errs, fmt.Errorf("kernel %s: the load test did not run all cases", k))
+		}
+	}
+	return b.String(), errors.Join(errs...)
 }
 
 // Interop builds psp_encrypt and psp_decrypt from google/psp and runs the

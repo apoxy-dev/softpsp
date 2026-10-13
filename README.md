@@ -21,7 +21,7 @@ without notice.
 | `replay` | RFC 6479 anti-replay window on the 32-bit sequence number. |
 | `vtep` | Datapath contract and drivers: `tun`, `netstack`, `afxdp`. |
 | `forwarder` | AF_XDP forwarder between a physical NIC and a veth. |
-| `filter` | XDP programs for the forwarder. |
+| `filter` | XDP programs for the forwarder, and the XDP program of a PSP relay. |
 | `queues`, `udp`, `veth`, `permissions`, `internal/xsk` | Helpers for the packages above. |
 
 ## Tests
