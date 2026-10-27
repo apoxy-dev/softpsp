@@ -642,60 +642,45 @@ func TestApplyRepeatedSPI(t *testing.T) {
 	}
 }
 
-const trunkTag = 0x00a5c3
-
 func newTrunkPeer(tb testing.TB, r *Receiver) *Peer {
 	tb.Helper()
-	// Lane 0 is for whole PSP packets, lane 1 for inner IP packets.
-	p, err := r.NewPeer(PeerConfig{MTU: testMTU, Lanes: 2, Trunk: true, NoReplayLanes: 1})
+	p, err := r.NewPeer(PeerConfig{MTU: testMTU, Lanes: 2, Trunk: true})
 	if err != nil {
 		tb.Fatal(err)
 	}
 	return p
 }
 
-// sealTrunk seals payload for the trunk SA sa with the sequence number seq.
-func sealTrunk(tb testing.TB, sa SA, seq uint32, payload []byte, isPSP bool) []byte {
+// openTrunk opens a trunk packet in place with key as the relay does:
+// ParseTrunkHeader, the AEAD open with the prefix as AAD, then CheckTrunk.
+func openTrunk(tb testing.TB, key, pkt []byte) []byte {
 	tb.Helper()
-	aead, err := psp.NewAEAD(sa.Key)
+	if _, err := psp.ParseTrunkHeader(pkt); err != nil {
+		tb.Fatalf("ParseTrunkHeader: %v", err)
+	}
+	aead, err := psp.NewAEAD(key)
 	if err != nil {
 		tb.Fatal(err)
 	}
-	h := psp.Header{SPI: sa.SPI, IV: uint64(seq), VNI: trunkTag, Flags: psp.FlagSeq, Seq: seq}
-	pkt := make([]byte, len(payload)+psp.Overhead)
-	seal := psp.Seal
-	if isPSP {
-		seal = psp.SealPSP
+	ct := pkt[psp.PrefixLen:]
+	payload, err := aead.Open(ct[:0], pkt[4:psp.HeaderLen], ct, pkt[:psp.PrefixLen])
+	if err != nil {
+		tb.Fatalf("open: %v", err)
 	}
-	if _, err := seal(aead, h, pkt, payload); err != nil {
-		tb.Fatal(err)
+	if err := psp.CheckTrunk(pkt, payload); err != nil {
+		tb.Fatalf("CheckTrunk: %v", err)
 	}
-	return pkt
+	return payload
 }
 
-// receiveTrunk wants the queue of lane to accept the trunk packet pkt with
-// payload, or to drop it with want.
-func receiveTrunk(tb testing.TB, tab *engine.RxTable, lane int, pkt, payload []byte, want error) {
-	tb.Helper()
-	got, tag, _, err := tab.Queue(lane).ReceiveTrunk(bytes.Clone(pkt))
-	if !errors.Is(err, want) {
-		tb.Fatalf("ReceiveTrunk: got %v, want %v", err, want)
-	}
-	if err == nil && (!bytes.Equal(got, payload) || tag != trunkTag) {
-		tb.Fatalf("ReceiveTrunk: payload %x tag %#x", got, tag)
-	}
-}
-
-// TestTrunkPeer gives a sender trunk SAs with the exchange of all other SAs.
-// The lane with no replay window passes a copy of a PSP packet and refuses an
-// inner IP packet. The lane with a window drops a copy. A rekey keeps this.
+// TestTrunkPeer checks that the key of each offered trunk SA opens its lane and
+// that Receive refuses the packet with ErrSource, also after a rekey.
 func TestTrunkPeer(t *testing.T) {
 	r, tab := newReceiver(t, 8, psp.AESGCM128)
 	s := newSender(t)
 	p, tp := newTrunkPeer(t, r), s.NewPeer()
 	agent, agentTx := newPeer(t, r, 1), s.NewPeer()
 	offer(t, agent, agentTx, t0)
-	fwd := seal(t, agentTx.SA(0)) // The PSP packet of an agent.
 
 	check := func(sas []SA) {
 		t.Helper()
@@ -706,31 +691,17 @@ func TestTrunkPeer(t *testing.T) {
 			if sa.Lane != i || sa.VNI != 0 || tp.SA(i).SPI() != sa.SPI {
 				t.Fatalf("SA %d: %+v", i, sa)
 			}
+			pkt := make([]byte, len(inner)+psp.Overhead)
+			if _, err := tp.SA(i).Seal(pkt, inner); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := tab.Queue(i).Receive(bytes.Clone(pkt)); !errors.Is(err, engine.ErrSource) {
+				t.Fatalf("Receive: got %v, want %v", err, engine.ErrSource)
+			}
+			if got := openTrunk(t, sa.Key, pkt); !bytes.Equal(got, inner) {
+				t.Fatalf("lane %d: inner %x", i, got)
+			}
 		}
-		pkt := make([]byte, len(fwd)+psp.Overhead)
-		if _, err := tp.SA(0).SealTrunkPSP(trunkTag, pkt, fwd); err != nil {
-			t.Fatal(err)
-		}
-		receiveTrunk(t, tab, 0, pkt, fwd, nil)
-		receiveTrunk(t, tab, 0, pkt, fwd, nil)
-		if _, _, err := tab.Queue(0).Receive(bytes.Clone(pkt)); err == nil {
-			t.Fatal("Receive accepted a trunk packet")
-		}
-
-		pkt = make([]byte, len(inner)+psp.Overhead)
-		if _, err := tp.SA(1).SealTrunk(trunkTag, pkt, inner); err != nil {
-			t.Fatal(err)
-		}
-		receiveTrunk(t, tab, 1, pkt, inner, nil)
-		receiveTrunk(t, tab, 1, pkt, inner, engine.ErrReplay)
-		if _, _, err := tab.Queue(1).Receive(bytes.Clone(pkt)); err == nil {
-			t.Fatal("Receive accepted a trunk packet")
-		}
-
-		if _, err := tp.SA(0).SealTrunk(trunkTag, pkt, inner); err != nil {
-			t.Fatal(err)
-		}
-		receiveTrunk(t, tab, 0, pkt, inner, engine.ErrPayload)
 	}
 	req := offer(t, p, tp, t0)
 	check(req.SAs)
@@ -746,44 +717,6 @@ func TestTrunkPeer(t *testing.T) {
 		apply(t, tp, u.Request, t0.Add(life*3/4))
 		check(u.SAs)
 	}
-	// The SAs of an agent on the same receiver still refuse trunk packets.
-	if _, _, _, err := tab.Queue(0).ReceiveTrunk(seal(t, agentTx.SA(0))); !errors.Is(err, engine.ErrUnknownSA) {
-		t.Fatalf("ReceiveTrunk of an agent SA: got %v, want %v", err, engine.ErrUnknownSA)
-	}
-}
-
-// TestTrunkRekeyPacketLimit checks that each trunk lane is rekeyed at 3/4 of
-// its packet limit. The lane with no replay window has no window to count in.
-func TestTrunkRekeyPacketLimit(t *testing.T) {
-	limit := psp.PacketLimit(testMTU)
-	at := limit - limit/4
-	cases := []struct {
-		name    string
-		lane    int
-		payload []byte
-		isPSP   bool
-	}{
-		{"no window", 0, sealSeq(t, SA{SPI: 0x77, Key: make([]byte, 16)}, 1), true},
-		{"window", 1, inner, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			r, tab := newReceiver(t, 8, psp.AESGCM128)
-			req := offer(t, newTrunkPeer(t, r), newSender(t).NewPeer(), t0)
-			sa := req.SAs[tc.lane]
-
-			receiveTrunk(t, tab, tc.lane, sealTrunk(t, sa, at-1, tc.payload, tc.isPSP), tc.payload, nil)
-			tick(t, r, t0.Add(time.Second), 0)
-			receiveTrunk(t, tab, tc.lane, sealTrunk(t, sa, at, tc.payload, tc.isPSP), tc.payload, nil)
-			// An older packet must not hide the count.
-			receiveTrunk(t, tab, tc.lane, sealTrunk(t, sa, at-2, tc.payload, tc.isPSP), tc.payload, nil)
-			ups := tick(t, r, t0.Add(time.Second), 1)
-			if len(ups[0].SAs) != 1 || ups[0].SAs[0].Lane != tc.lane {
-				t.Fatalf("got %+v, want a rekey of lane %d", ups[0].SAs, tc.lane)
-			}
-			receiveTrunk(t, tab, tc.lane, sealTrunk(t, sa, at+1, tc.payload, tc.isPSP), tc.payload, nil) // The overlap.
-		})
-	}
 }
 
 func TestTrunkConfigErrors(t *testing.T) {
@@ -794,9 +727,6 @@ func TestTrunkConfigErrors(t *testing.T) {
 	}{
 		{"trunk peer with a VNI", PeerConfig{VNI: 1, MTU: testMTU, Lanes: 2, Trunk: true}},
 		{"trunk peer with a source check", PeerConfig{MTU: testMTU, Lanes: 2, Trunk: true, Sources: sources}},
-		{"more lanes with no window than lanes", PeerConfig{MTU: testMTU, Lanes: 2, Trunk: true, NoReplayLanes: 3}},
-		{"-1 lanes with no window", PeerConfig{MTU: testMTU, Lanes: 2, Trunk: true, NoReplayLanes: -1}},
-		{"plain peer with no window", PeerConfig{VNI: 1, MTU: testMTU, Lanes: 2, Sources: sources, NoReplayLanes: 1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

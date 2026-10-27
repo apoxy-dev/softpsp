@@ -104,8 +104,8 @@ func deriveKey(t *testing.T, masters [2]hexBytes, spi uint32, suite psp.Version)
 	return key
 }
 
-// checkPacket checks that the codec seals v.Inner to exactly v.PSP on both
-// paths, and that it parses and opens v.PSP to v.Inner on both paths.
+// checkPacket checks that Seal seals v.Inner to exactly v.PSP, and that the
+// codec parses v.PSP and opens it to v.Inner with Open and with OpenInPlace.
 func checkPacket(t *testing.T, masters [2]hexBytes, v pktVector) {
 	t.Helper()
 	aead, err := psp.NewAEAD(deriveKey(t, masters, v.SPI, v.Suite))
@@ -120,14 +120,6 @@ func checkPacket(t *testing.T, masters [2]hexBytes, v pktVector) {
 	}
 	if !bytes.Equal(got, v.PSP) {
 		t.Fatalf("Seal\n got %x\nwant %x", got, []byte(v.PSP))
-	}
-	buf := append(make([]byte, psp.PrefixLen), v.Inner...)
-	buf = append(buf, make([]byte, psp.ICVLen)...)
-	if _, _, err := psp.SealInPlace(aead, h, buf, psp.PrefixLen, len(v.Inner)); err != nil {
-		t.Fatalf("SealInPlace: %v", err)
-	}
-	if !bytes.Equal(buf, v.PSP) {
-		t.Fatalf("SealInPlace\n got %x\nwant %x", buf, []byte(v.PSP))
 	}
 
 	ph, err := psp.ParseHeader(v.PSP)

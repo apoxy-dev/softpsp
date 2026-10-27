@@ -14,8 +14,8 @@
 // many goroutines can run it at once. Accept then checks the replay window on
 // one goroutine, in packet order.
 //
-// A trunk SA carries packets between two relays: a sender tag in the VNI
-// field, no source check, and a replay window that can be off. See trunk.go.
+// A trunk SA is the receive SA of the packets between two relays: no VNI and
+// no source check. Receive and Open accept none of its packets.
 package engine
 
 import (
@@ -50,7 +50,6 @@ var (
 	ErrLimit     = errors.New("engine: sequence number is at or above the SA packet limit")
 	ErrSource    = errors.New("engine: inner source is not allowed for the SA")
 	ErrReplay    = errors.New("engine: sequence number is a replay or too old")
-	ErrPayload   = errors.New("engine: SA with no replay window accepts only a PSP packet as payload")
 	ErrFull      = errors.New("engine: no free receive row")
 	// ErrHandoff tells that the packet went to the owner queue of its SA.
 	ErrHandoff = errors.New("engine: packet went to the owner queue of the SA")
@@ -82,13 +81,13 @@ type RxSA struct {
 	// Sources reports whether an inner source address is allowed, for example
 	// Routes.Sources. It runs for each packet and must not lock or allocate.
 	Sources func(netip.Addr) bool
-	// Trunk makes a trunk SA. It has no VNI and no Sources, and only
-	// ReceiveTrunk accepts its packets.
+	// Trunk makes a trunk SA. It has no VNI and no Sources, and Receive and
+	// Open accept none of its packets.
 	Trunk bool
-	// NoReplay gives a trunk SA no replay window. The SA then accepts only
-	// whole PSP packets, because the receiver of each one has its own window.
-	NoReplay bool
 }
+
+// noSource is the source check of a trunk SA: it allows no address.
+func noSource(netip.Addr) bool { return false }
 
 // RxStats are the counters of one receive SA.
 type RxStats struct {
@@ -116,17 +115,15 @@ type RxTable struct {
 }
 
 type rxRow struct {
-	spi      uint32
-	version  psp.Version
-	trunk    bool // Trunk SA. Its sources allows no address.
-	noReplay bool // Trunk SA that has no replay window.
-	vni      uint32
-	limit    uint32
-	maxLen   int   // Longest PSP packet that a hand-off copies.
-	expires  int64 // Unix nanoseconds.
-	aead     cipher.AEAD
-	sources  func(netip.Addr) bool
-	owner    atomic.Int32 // Owner queue. AnyQueue until the first packet passes.
+	spi     uint32
+	version psp.Version
+	vni     uint32
+	limit   uint32
+	maxLen  int   // Longest PSP packet that a hand-off copies.
+	expires int64 // Unix nanoseconds.
+	aead    cipher.AEAD
+	sources func(netip.Addr) bool
+	owner   atomic.Int32 // Owner queue. AnyQueue until the first packet passes.
 
 	// Only Accept on the owner queue writes window, seq, packets and replays.
 	// Open counts ICV failures and rejects, on more than one goroutine.
@@ -202,13 +199,11 @@ func (t *RxTable) Add(sa RxSA) (uint32, []byte, error) {
 		return 0, nil, fmt.Errorf("engine: lane must be AnyQueue or 0 to %d, got %d", len(t.queues)-1, sa.Lane)
 	case sa.Trunk && (sa.VNI != 0 || sa.Sources != nil):
 		return 0, nil, errors.New("engine: a trunk SA has no VNI and no source check")
-	case !sa.Trunk && sa.NoReplay:
-		return 0, nil, errors.New("engine: only a trunk SA can have no replay window")
 	case !sa.Trunk && sa.Sources == nil:
 		return 0, nil, errors.New("engine: no source check")
 	}
 	if sa.Trunk {
-		// Receive and Open then drop each packet of the SA at the source check.
+		// An inner IP packet of the SA then fails the source check.
 		sa.Sources = noSource
 	}
 
@@ -236,16 +231,14 @@ func (t *RxTable) Add(sa RxSA) (uint32, []byte, error) {
 		return 0, nil, err
 	}
 	row := &rxRow{
-		spi:      spi,
-		version:  sa.Version,
-		trunk:    sa.Trunk,
-		noReplay: sa.NoReplay,
-		vni:      sa.VNI,
-		limit:    psp.PacketLimit(sa.MTU),
-		maxLen:   sa.MTU + psp.Overhead,
-		expires:  time.Now().Add(t.lifetime).UnixNano(),
-		aead:     aead,
-		sources:  sa.Sources,
+		spi:     spi,
+		version: sa.Version,
+		vni:     sa.VNI,
+		limit:   psp.PacketLimit(sa.MTU),
+		maxLen:  sa.MTU + psp.Overhead,
+		expires: time.Now().Add(t.lifetime).UnixNano(),
+		aead:    aead,
+		sources: sa.Sources,
 	}
 	row.owner.Store(int32(sa.Lane))
 	t.rows[r].Store(row)

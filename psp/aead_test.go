@@ -36,33 +36,18 @@ func testInner(ipv, n int) []byte {
 	return p
 }
 
-// sealBoth seals inner with Seal and with SealInPlace, checks that both give
-// the same bytes, and returns them.
-func sealBoth(tb testing.TB, aead cipher.AEAD, h Header, inner []byte) []byte {
+// sealPkt seals inner with Seal and returns the PSP packet.
+func sealPkt(tb testing.TB, aead cipher.AEAD, h Header, inner []byte) []byte {
 	tb.Helper()
-	cross := make([]byte, len(inner)+Overhead)
-	n, err := Seal(aead, h, cross, inner)
+	pkt := make([]byte, len(inner)+Overhead)
+	n, err := Seal(aead, h, pkt, inner)
 	if err != nil {
 		tb.Fatalf("Seal: %v", err)
 	}
-	if n != len(cross) {
-		tb.Fatalf("Seal length: got %d, want %d", n, len(cross))
+	if n != len(pkt) {
+		tb.Fatalf("Seal length: got %d, want %d", n, len(pkt))
 	}
-
-	const headroom = PrefixLen + 42 // Room for outer headers too.
-	buf := make([]byte, headroom+len(inner)+ICVLen+3)
-	copy(buf[headroom:], inner)
-	start, length, err := SealInPlace(aead, h, buf, headroom, len(inner))
-	if err != nil {
-		tb.Fatalf("SealInPlace: %v", err)
-	}
-	if start != headroom-PrefixLen || length != len(cross) {
-		tb.Fatalf("SealInPlace window: got (%d, %d), want (%d, %d)", start, length, headroom-PrefixLen, len(cross))
-	}
-	if got := buf[start : start+length]; !bytes.Equal(got, cross) {
-		tb.Fatalf("in-place and cross-buffer bytes differ\n in-place %x\n    cross %x", got, cross)
-	}
-	return cross
+	return pkt
 }
 
 // openBoth opens pkt with Open and with OpenInPlace and checks both give inner.
@@ -93,7 +78,7 @@ func TestSealOpen(t *testing.T) {
 					aead := testAEAD(t, v)
 					h := Header{Version: v, SPI: 0x80000001, IV: uint64(n), VNI: 0xabcdef, Flags: FlagSeq, Seq: 42}
 					inner := testInner(ipv, n)
-					pkt := sealBoth(t, aead, h, inner)
+					pkt := sealPkt(t, aead, h, inner)
 
 					got, err := ParseHeader(pkt)
 					if err != nil {
@@ -122,40 +107,29 @@ func TestSealErrors(t *testing.T) {
 		h       Header
 		inner   []byte
 		dst     int // len(dst) for Seal.
-		off     int // off for SealInPlace.
-		tail    int // Tailroom for SealInPlace.
 		wantErr error
 	}{
-		{name: "version 2", h: Header{Version: 2, SPI: 1}, inner: inner, dst: 60, off: PrefixLen, tail: ICVLen, wantErr: ErrVersion},
-		{name: "SPI 0", h: Header{}, inner: inner, dst: 60, off: PrefixLen, tail: ICVLen, wantErr: ErrSPI},
-		{name: "SPI MSB only", h: Header{SPI: 0x80000000}, inner: inner, dst: 60, off: PrefixLen, tail: ICVLen, wantErr: ErrSPI},
-		{name: "VNI too big", h: Header{SPI: 1, VNI: MaxVNI + 1}, inner: inner, dst: 60, off: PrefixLen, tail: ICVLen, wantErr: ErrVNI},
-		{name: "empty inner", h: good, inner: nil, dst: 60, off: PrefixLen, tail: ICVLen, wantErr: ErrNextHdr},
-		{name: "not IP", h: good, inner: testInner(5, 20), dst: 60, off: PrefixLen, tail: ICVLen, wantErr: ErrNextHdr},
-		{name: "small dst or tailroom", h: good, inner: inner, dst: 59, off: PrefixLen, tail: ICVLen - 1, wantErr: ErrBuffer},
-		{name: "no headroom", h: good, inner: inner, dst: 59, off: PrefixLen - 1, tail: ICVLen, wantErr: ErrBuffer},
+		{name: "version 2", h: Header{Version: 2, SPI: 1}, inner: inner, dst: 60, wantErr: ErrVersion},
+		{name: "SPI 0", h: Header{}, inner: inner, dst: 60, wantErr: ErrSPI},
+		{name: "SPI MSB only", h: Header{SPI: 0x80000000}, inner: inner, dst: 60, wantErr: ErrSPI},
+		{name: "VNI too big", h: Header{SPI: 1, VNI: MaxVNI + 1}, inner: inner, dst: 60, wantErr: ErrVNI},
+		{name: "empty inner", h: good, inner: nil, dst: 60, wantErr: ErrNextHdr},
+		{name: "not IP", h: good, inner: testInner(5, 20), dst: 60, wantErr: ErrNextHdr},
+		{name: "small dst", h: good, inner: inner, dst: 59, wantErr: ErrBuffer},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := Seal(aead, tc.h, make([]byte, tc.dst), tc.inner); !errors.Is(err, tc.wantErr) {
 				t.Fatalf("Seal: got %v, want %v", err, tc.wantErr)
 			}
-			buf := make([]byte, tc.off+len(tc.inner)+tc.tail)
-			copy(buf[tc.off:], tc.inner)
-			if _, _, err := SealInPlace(aead, tc.h, buf, tc.off, len(tc.inner)); !errors.Is(err, tc.wantErr) {
-				t.Fatalf("SealInPlace: got %v, want %v", err, tc.wantErr)
-			}
 		})
-	}
-	if _, _, err := SealInPlace(aead, good, make([]byte, 100), PrefixLen, -1); !errors.Is(err, ErrBuffer) {
-		t.Fatalf("SealInPlace with n < 0: got %v, want %v", err, ErrBuffer)
 	}
 }
 
 func TestOpenErrors(t *testing.T) {
 	aead := testAEAD(t, AESGCM128)
 	inner := testInner(4, 64)
-	pkt := sealBoth(t, aead, Header{SPI: 1, IV: 1, VNI: 3, Flags: FlagSeq, Seq: 1}, inner)
+	pkt := sealPkt(t, aead, Header{SPI: 1, IV: 1, VNI: 3, Flags: FlagSeq, Seq: 1}, inner)
 
 	// An inner IPv4 packet under Next Header 41. It authenticates, and Open
 	// must still drop it.
@@ -249,10 +223,9 @@ func TestNoAllocs(t *testing.T) {
 		{"ParseHeader", func() { _, _ = ParseHeader(pkt) }},
 		{"Seal", func() { _, _ = Seal(aead, h, dst, inner) }},
 		{"Open", func() { _, _ = Open(aead, dst, pkt) }},
-		{"SealInPlace+OpenInPlace", func() {
-			copy(buf[64:], inner)
-			start, n, _ := SealInPlace(aead, h, buf, 64, len(inner))
-			_, _ = OpenInPlace(aead, buf[start:start+n])
+		{"OpenInPlace", func() {
+			copy(buf, pkt)
+			_, _ = OpenInPlace(aead, buf[:len(pkt)])
 		}},
 	}
 	for _, tc := range cases {
@@ -262,9 +235,8 @@ func TestNoAllocs(t *testing.T) {
 	}
 }
 
-// FuzzSealOpen checks that in-place and cross-buffer sealing give the same
-// bytes, that both open paths give back the inner packet, and that a one-bit
-// change anywhere in the packet fails.
+// FuzzSealOpen checks that both open paths give back the inner packet of Seal,
+// and that a one-bit change anywhere in the packet fails.
 func FuzzSealOpen(f *testing.F) {
 	f.Add([]byte{0x45, 1, 2, 3}, false, uint32(1), uint64(1), uint32(7), uint8(FlagSeq), uint32(1), uint16(0))
 	f.Add(testInner(6, 1280), true, uint32(0x9a345678), uint64(1<<63), uint32(MaxVNI), uint8(0xff), uint32(1<<31), uint16(900))
@@ -278,7 +250,7 @@ func FuzzSealOpen(f *testing.F) {
 			v = AESGCM256
 		}
 		aead := aeads[v]
-		pkt := sealBoth(t, aead, Header{Version: v, SPI: spi, IV: iv, VNI: vni, Flags: flags, Seq: seq}, inner)
+		pkt := sealPkt(t, aead, Header{Version: v, SPI: spi, IV: iv, VNI: vni, Flags: flags, Seq: seq}, inner)
 		if _, err := ParseHeader(pkt); err != nil {
 			t.Fatalf("ParseHeader of a sealed packet: %v", err)
 		}
@@ -317,20 +289,6 @@ func BenchmarkSeal(b *testing.B) {
 					h.Seq++
 					h.IV++
 					if _, err := Seal(aead, h, dst, inner); err != nil {
-						b.Fatal(err)
-					}
-				}
-			})
-			b.Run(fmt.Sprintf("v%d/%d/inplace", v, n), func(b *testing.B) {
-				buf := make([]byte, PrefixLen+n+ICVLen)
-				copy(buf[PrefixLen:], inner)
-				b.SetBytes(int64(n))
-				b.ReportAllocs()
-				for b.Loop() {
-					h.Seq++
-					h.IV++
-					buf[PrefixLen] = inner[0] // Seal wrote ciphertext over it.
-					if _, _, err := SealInPlace(aead, h, buf, PrefixLen, n); err != nil {
 						b.Fatal(err)
 					}
 				}

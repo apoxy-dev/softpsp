@@ -24,7 +24,7 @@ import (
 // The AAD is bytes 0-23 and the AES-GCM nonce is SPI || IV (bytes 4-15).
 //
 // On a trunk SA the VNI field holds a tag from the sender, and Next Header 63
-// means that the payload is a whole PSP packet.
+// means that the payload is a message between relays, not an IP packet.
 const (
 	HeaderLen = 16                // PSP header up to and including the IV.
 	VCLen     = 8                 // Virtualization cookie: VNI word and sequence number.
@@ -34,9 +34,9 @@ const (
 	MaxVNI    = 1<<24 - 1
 	NextHdrV4 = 4  // Next Header for an inner IPv4 packet.
 	NextHdrV6 = 41 // Next Header for an inner IPv6 packet.
-	// NextHdrPSP is the Next Header for a whole PSP packet as the payload, on
-	// a trunk SA only. Below 64, a socket with QUIC reads it as not QUIC.
-	NextHdrPSP = 63
+	// NextHdrMessage: a message between relays, not an IP packet, on a trunk SA
+	// only. 63 is IANA "any local network"; below 64, QUIC reads it as not QUIC.
+	NextHdrMessage = 63
 
 	// FlagSeq is flag S of the VNI word: the VC carries a 32-bit sequence number.
 	FlagSeq uint8 = 0x80
@@ -57,7 +57,7 @@ const (
 var (
 	ErrShort   = errors.New("psp: packet too short")
 	ErrBuffer  = errors.New("psp: buffer too small")
-	ErrNextHdr = errors.New("psp: next header does not match an inner IPv4 or IPv6 packet")
+	ErrNextHdr = errors.New("psp: next header is not valid or does not match the payload")
 	ErrHeader  = errors.New("psp: header is not tunnel mode with a VC in clear")
 	ErrVersion = errors.New("psp: unsupported version")
 	ErrDrop    = errors.New("psp: drop bit set")
@@ -68,7 +68,7 @@ var (
 
 // Header is the PSP header and VC of a tunnel-mode packet.
 type Header struct {
-	NextHdr uint8 // NextHdrV4, NextHdrV6 or NextHdrPSP. Seal takes it from the inner packet.
+	NextHdr uint8 // NextHdrV4, NextHdrV6 or NextHdrMessage. Seal takes it from the inner packet.
 	Version Version
 	SPI     uint32
 	IV      uint64
@@ -113,9 +113,9 @@ func ParseHeader(pkt []byte) (Header, error) {
 }
 
 // ParseTrunkHeader is ParseHeader for a packet of a trunk SA. It also accepts
-// NextHdrPSP.
+// NextHdrMessage.
 func ParseTrunkHeader(pkt []byte) (Header, error) {
-	if len(pkt) < Overhead || pkt[0] != NextHdrPSP {
+	if len(pkt) < Overhead || pkt[0] != NextHdrMessage {
 		return ParseHeader(pkt)
 	}
 	// The other checks do not read Next Header, so ParseHeader does them on a
@@ -127,13 +127,15 @@ func ParseTrunkHeader(pkt []byte) (Header, error) {
 	if err != nil {
 		return Header{}, err
 	}
-	h.NextHdr = NextHdrPSP
+	h.NextHdr = NextHdrMessage
 	return h, nil
 }
 
-// check returns an error if Seal cannot send h.
+// check returns an error if PutHeader cannot write h.
 func (h *Header) check() error {
 	switch {
+	case h.NextHdr != NextHdrV4 && h.NextHdr != NextHdrV6 && h.NextHdr != NextHdrMessage:
+		return ErrNextHdr
 	case !h.Version.Valid():
 		return ErrVersion
 	case ReservedSPI(h.SPI):

@@ -18,8 +18,8 @@ import (
 // Receiver creates the SAs of one RxTable. It keeps two master keys, and bit 31
 // of each SPI selects one.
 //
-// An SA is rekeyed after 3/4 of its lifetime or 3/4 of its packet limit. The
-// SA that a rekey replaces stays for at most 1/4 of the lifetime.
+// An SA is rekeyed at 3/4 of its lifetime or packet limit (no packet count for a
+// trunk SA). The SA that a rekey replaces stays for at most 1/4 of the lifetime.
 type Receiver struct {
 	table    *engine.RxTable
 	version  psp.Version
@@ -45,9 +45,6 @@ type PeerConfig struct {
 	// Trunk makes trunk SAs (engine.RxSA.Trunk), for the packets from another
 	// relay. They have no VNI and no Sources.
 	Trunk bool
-	// NoReplayLanes is the number of trunk lanes, from lane 0, whose SAs have
-	// no replay window (engine.RxSA.NoReplay).
-	NoReplayLanes int
 }
 
 // Peer is one sender of a Receiver.
@@ -115,10 +112,6 @@ func (r *Receiver) NewPeer(cfg PeerConfig) (*Peer, error) {
 		return nil, errors.New("keys: a trunk peer has no VNI and no source check")
 	case !cfg.Trunk && cfg.Sources == nil:
 		return nil, errors.New("keys: no source check")
-	case !cfg.Trunk && cfg.NoReplayLanes != 0:
-		return nil, errors.New("keys: only a trunk peer can have lanes with no replay window")
-	case cfg.NoReplayLanes < 0 || cfg.NoReplayLanes > cfg.Lanes:
-		return nil, fmt.Errorf("keys: lanes with no replay window must be 0 to %d, got %d", cfg.Lanes, cfg.NoReplayLanes)
 	}
 	return &Peer{r: r, cfg: cfg, lanes: make([]*rxSA, cfg.Lanes)}, nil
 }
@@ -250,7 +243,6 @@ func (p *Peer) replace(lanes []int, now time.Time) ([]SA, error) {
 			MTU:         p.cfg.MTU,
 			Lane:        owner,
 			Trunk:       p.cfg.Trunk,
-			NoReplay:    lane < p.cfg.NoReplayLanes,
 		})
 		if err != nil {
 			for _, sa := range made {
